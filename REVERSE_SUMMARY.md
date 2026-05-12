@@ -49,6 +49,23 @@ spoof_key.js
 hook_sub_DAC.js
 hook_sub_DAC_mmap.js
 hook_dump_unpacked_chunks.js
+hook_dump_after_reloc_frida17.js
+hook_dump_unpacked_and_reloc_frida17.js
+hook_dump_unpacked_and_reloc_leaveonly_frida17.js
+hook_init_decoders_frida17.js
+hook_sub_3CE5C_frida17.js
+hook_sub_367A8_jni_calls_frida17.js
+hook_sub_374A0_jni_refs_frida17.js
+hook_sub_3C3FC_fileio_frida17.js
+hook_sub_3C3FC_fileio_safe_frida17.js
+hook_sub_363F0_decode_v0_v1_frida17.js
+hook_unpacked_fn_args_ret_frida17.js
+ida_rename_plt_again.py
+ida_normalize_internal_ptrs.py
+ida_rename_sub_3B614.py
+ida_decode_sub_401B0.py
+merge_relocated_with_metadata.py
+normalize_internal_reloc_ptrs.py
 ```
 
 ### Dumped unpacked chunks
@@ -773,8 +790,14 @@ Current meaning of each init-array entry:
          Uses encoded seed at 0x89160. First XOR-decodes 0x40 bytes with 0x5a,
          expands/generates final 108-byte table into the heap buffer pointed by qword_891B0,
          then wipes seed 0x89160..0x8919f to zero.
-         Final qword_891B0 buffer observed:
-         61d5ccc16f7eaa1fdb8d22c0b2b53829152f8fc339d8b57adac470338b297d2c75ba0aa0df4ba4b11a187e81ce3cb1a518c8ea359364a1b31f824453b9f5785a1841527f6d98b2f82c36e6f96d7da3038676beac5a5d098ae71a9fc4ac17a897e6afd8bafbfaa8387b9c1b0e
+         Final qword_891B0 / qword_8CB40 table verified by static emulation of sub_37FF8:
+         61d5ccc1cc0659b29b30e842f6fab3bd15edef6db465bf039775912d6e499aa20942d5d627bcafb8382f0055894fc3797529cb2ce6ec025423c8c33f6fd8b88065f72dca2a77a28a86a432549aab97cfa325cea8c96bbe3c0430df004b234a70dde895c6bd53d420909ae98a
+         Verification strings decoded with sub_401B0:
+           0x4143 len 15 -> /proc/self/exe
+           0x3991 len 8  -> libc.so
+           0x3406 len 22 -> __system_property_get
+           0x2DCF len 21 -> ro.build.version.sdk
+         Note: older note/table beginning `61d5ccc16f7e...` was wrong.
 
 0x40194  init_copy_decoded_blob_ptr_to_8CB40
          Runtime: qword_8CB40 = qword_891B0.
@@ -1219,7 +1242,315 @@ PT_DYNAMIC 0x84960
 
 ---
 
-## 24. Mental model
+## 24. `sub_374A0` and `sub_367A8` JNI setup
+
+### `sub_374A0(JNIEnv *env)`
+
+Not `RegisterNatives`. It is a JNI reference/cache initializer.
+
+It decodes hidden class/method/field names with `sub_401B0` / `sub_55610`, calls JNI APIs, checks `ExceptionCheck` after most calls, and stores global refs / IDs into globals such as:
+
+```text
+qword_8CA30
+qword_8C9F8
+qword_8CA18
+qword_8CA48
+qword_8CA40
+qword_8CA08
+qword_8CA50
+qword_8CA10
+qword_8CA58
+```
+
+JNI table offsets identified:
+
+```text
+0x30   FindClass
+0xA8   NewGlobalRef
+0xF8   GetObjectClass
+0x108  GetMethodID
+0x110  CallObjectMethod
+0x2F0  GetFieldID
+0x2F8  GetObjectField
+0x388  GetStaticMethodID
+0x390  CallStaticObjectMethod
+0x480  GetStaticFieldID
+0x488  GetStaticObjectField
+0x538  NewStringUTF
+0x6B8  RegisterNatives
+0x720  ExceptionCheck
+```
+
+`sub_374A0` does not use `RegisterNatives` (`JNIEnv+0x6B8` was not observed).
+
+### `sub_367A8(JNIEnv *env)`
+
+Runtime hook script used:
+
+```text
+hook_sub_367A8_jni_calls_frida17.js
+```
+
+Observed JNI calls show `sub_367A8` manipulates Android framework startup state around ContentProviders.
+
+Observed log summary:
+
+```text
+obj=0x3186 likely ActivityThread.AppBindData
+field providers Ljava/util/List;
+providers = appBindData.providers
+providers.isEmpty() -> false
+NewGlobalRef(providers) -> saved global provider list
+appBindData.providers = null
+field restrictedBackupMode Z -> false
+class 0x3146 likely android.app.ActivityThread
+field mInitialApplication Landroid/app/Application;
+method installContentProviders(Context,List)V
+activityThread.mInitialApplication = applicationObject
+```
+
+Meaning:
+
+```java
+AppBindData data = ...;
+List providers = data.providers;
+
+if (providers != null && !providers.isEmpty()) {
+    savedProviders = NewGlobalRef(providers);   // qword_8CA28
+}
+
+data.providers = null;                         // prevent framework auto-install now
+restrictedBackupMode = data.restrictedBackupMode;
+
+ActivityThread at = ...;
+Application app = ...;
+
+at.mInitialApplication = app;
+
+cache:
+  ActivityThread.mInitialApplication
+  ActivityThread.installContentProviders(Context, List)
+```
+
+Why protector does this:
+
+```text
+Android ContentProviders normally run before Application.onCreate().
+DexProtector wants no app/provider code to execute before unpack/decrypt/classloader/env-check setup is complete.
+So it steals the providers list, clears AppBindData.providers, finishes protector initialization,
+and later can manually call ActivityThread.installContentProviders(context, savedProviders).
+```
+
+Short name:
+
+```c
+sub_367A8 = init_delay_content_providers_and_cache_activitythread_fields
+```
+
+---
+
+## 25. Recent decoded helpers / small utility funcs
+
+### `sub_401B0` quick decoder facts
+
+`sub_401B0(blob, out, len)` is the common small string decoder.
+It is not a normal C string pointer input; the input points to a blob:
+
+```text
+blob+0  u32 state_a
+blob+4  u32 state_b
+blob+8  ciphertext bytes
+```
+
+The keystream is generated from the 0x6c-byte table copied to `qword_8CB40` by init `0x40194`.
+That table is generated by init `0x37FF8` from seed `0x89160`.
+
+Verified table:
+
+```text
+61d5ccc1cc0659b29b30e842f6fab3bd15edef6db465bf039775912d6e499aa20942d5d627bcafb8382f0055894fc3797529cb2ce6ec025423c8c33f6fd8b88065f72dca2a77a28a86a432549aab97cfa325cea8c96bbe3c0430df004b234a70dde895c6bd53d420909ae98a
+```
+
+Useful decoded examples:
+
+```text
+sub_401B0(dword_4143, out, 15)      -> "/proc/self/exe"
+sub_401B0(dword_3991, out, 8)       -> "libc.so"
+sub_401B0(dword_3406, out, 22)      -> "__system_property_get"
+sub_401B0(dword_2DCF, out, 21)      -> "ro.build.version.sdk"
+sub_401B0(&loc_52E4, out, 27)       -> "ro.product.first_api_level"
+```
+
+IDA may label a data blob as `loc_52E4`; here it is data, not real code.
+
+### `sub_1529C`
+
+`sub_1529C(a1, a2, a3)` is a `strtoull`-like parser, not decrypt/decode.
+
+Likely prototype:
+
+```c
+uint64_t strtoull_like(const char *s, char **endptr, unsigned int base);
+```
+
+Behavior:
+
+```text
+- accepts base 0 or 2..36; rejects base 1 / base > 36
+- skips ASCII whitespace
+- accepts optional '+' / '-'
+- base 0 auto-detects:
+    0x / 0X -> base 16
+    leading 0 -> base 8
+    otherwise -> base 10
+- parses 0-9/a-z/A-Z digits
+- overflow saturates to UINT64_MAX
+- if endptr != NULL, stores pointer to first unparsed char
+```
+
+### SDK range check
+
+This pattern:
+
+```c
+if ((uint64_t)(sdk_ver - 1) > 0xFE)
+    return 13;
+```
+
+means:
+
+```c
+if (sdk_ver < 1 || sdk_ver > 255)
+    return 13;
+```
+
+The unsigned cast makes `sdk_ver == 0` underflow to `UINT64_MAX`, so it also fails.
+
+---
+
+## 26. More recent runtime helpers and r_debug lookups
+
+### `sub_3B614`: manual `dlsym` via `r_debug`
+
+`sub_3B614(lib_name, symbol_name)` walks the dynamic linker's `r_debug->r_map` list and resolves a symbol manually.
+
+High-level behavior:
+
+```c
+r_debug = sub_3C3F0();
+for (link_map *lm = r_debug->r_map; lm; lm = lm->l_next) {
+    // lm->l_addr = load bias
+    // lm->l_name = mapped library path
+    // lm->l_ld   = dynamic section
+    if (library_name_matches(lm->l_name, lib_name)) {
+        parse_dynamic(lm->l_ld, lm->l_addr);
+        return find_symbol_runtime_address(symbol_name);
+    }
+}
+return 0;
+```
+
+If `lib_name` begins with `/`, it compares full path. Otherwise it compares basename of `lm->l_name`.
+
+Confirmed decode around caller `sub_363F0`:
+
+```c
+v0 = sub_401B0(dword_3991, out, 8);   // "libc.so"
+v1 = sub_401B0(dword_3406, out, 22);  // "__system_property_get"
+v2 = sub_3B614(v0, v1);               // resolve libc __system_property_get
+v4 = sub_401B0(dword_2DCF, out, 21);  // "ro.build.version.sdk"
+v2(v4, buf);                          // read Android SDK property
+sdk_ver = atoi/strtoull_like(buf);
+```
+
+Suggested name:
+
+```c
+sub_3B614 = manual_dlsym_from_r_debug
+```
+
+Related scripts:
+
+```text
+hook_sub_363F0_decode_v0_v1_frida17.js
+ida_rename_sub_3B614.py
+```
+
+### `sub_3C3FC`: second way to find `r_debug`
+
+`sub_3C3FC()` finds the linker `r_debug` pointer by reading the main executable ELF and process maps, instead of walking auxv like outer `sub_2358`.
+
+Observed runtime flow:
+
+```text
+sub_401B0(dword_4143, out, 15) -> "/proc/self/exe"
+readlinkat(AT_FDCWD, "/proc/self/exe", ...) -> "/system/bin/app_process64"
+openat(AT_FDCWD, "/system/bin/app_process64", O_RDONLY)
+read ELF header
+lseek to program header table
+read program headers
+find PT_LOAD and PT_DYNAMIC
+use /proc/self/maps helper sub_3C218 to compute runtime base
+scan dynamic section for DT_DEBUG
+store qword_8CB10 = DT_DEBUG value = r_debug pointer
+```
+
+Difference from outer `libdexprotector.so`:
+
+```text
+outer sub_2220/sub_2358:
+  /proc/self/stat -> stack -> auxv -> main dynamic -> DT_DEBUG -> r_debug
+
+hidden sub_3C3FC:
+  /proc/self/exe -> app_process64 file -> ELF phdr -> maps base -> dynamic -> DT_DEBUG -> r_debug
+```
+
+Result is still the address of `struct r_debug`.
+
+Related scripts:
+
+```text
+hook_sub_3C3FC_fileio_frida17.js       // old inline SVC version; can crash after success
+hook_sub_3C3FC_fileio_safe_frida17.js  // safer probe/log version
+```
+
+### Generic unpacked-function hook helper
+
+Script:
+
+```text
+hook_unpacked_fn_args_ret_frida17.js
+```
+
+Purpose: hook an unpacked-image function by RVA and print args/return value.
+Run with Frida parameters, for example:
+
+```text
+-P '{"offset":"0x3B614","argc":2}'
+```
+
+It waits for the hidden image load bias from outer linker flow, then attaches to `load_bias + offset`.
+
+### Simple IDA paste/file decoder
+
+Script file now available:
+
+```text
+ida_decode_sub_401B0.py
+```
+
+This is the simple pasteable IDAPython decoder for `sub_401B0` blobs. Edit only:
+
+```python
+BLOB_EA = 0x2DCF
+LENGTH  = 21
+```
+
+Then run in IDA's Python script window. It prints decoded text and hex.
+
+---
+
+## 27. Mental model
 
 Outer loader:
 
@@ -1262,3 +1593,5 @@ Current next battle:
 ```text
 Find which check inside sub_4E354 returns nonzero and causes MessageGuardException.
 ```
+
+---
