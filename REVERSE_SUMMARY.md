@@ -60,10 +60,12 @@ hook_sub_3C3FC_fileio_frida17.js
 hook_sub_3C3FC_fileio_safe_frida17.js
 hook_sub_363F0_decode_v0_v1_frida17.js
 hook_unpacked_fn_args_ret_frida17.js
+bypass_dex_frida17.js
 ida_rename_plt_again.py
 ida_normalize_internal_ptrs.py
 ida_rename_sub_3B614.py
 ida_decode_sub_401B0.py
+ida_comment_decode_calls.py
 merge_relocated_with_metadata.py
 normalize_internal_reloc_ptrs.py
 ```
@@ -1383,6 +1385,14 @@ sub_401B0(&loc_52E4, out, 27)       -> "ro.product.first_api_level"
 
 IDA may label a data blob as `loc_52E4`; here it is data, not real code.
 
+Helper script:
+
+```text
+ida_comment_decode_calls.py
+```
+
+Scans all direct `BL decode/sub_401B0` call sites, statically resolves common `X0=blob` and `W2=len` setup patterns, decodes the string, and writes comments at the call site and blob address. It also handles simple shared jump-table decode call sites by checking predecessor branches.
+
 ### `sub_1529C`
 
 `sub_1529C(a1, a2, a3)` is a `strtoull`-like parser, not decrypt/decode.
@@ -1520,6 +1530,7 @@ Script:
 
 ```text
 hook_unpacked_fn_args_ret_frida17.js
+bypass_dex_frida17.js
 ```
 
 Purpose: hook an unpacked-image function by RVA and print args/return value.
@@ -1537,6 +1548,7 @@ Script file now available:
 
 ```text
 ida_decode_sub_401B0.py
+ida_comment_decode_calls.py
 ```
 
 This is the simple pasteable IDAPython decoder for `sub_401B0` blobs. Edit only:
@@ -1547,6 +1559,24 @@ LENGTH  = 21
 ```
 
 Then run in IDA's Python script window. It prints decoded text and hex.
+
+### `bypass_dex_frida17.js`
+
+Current bypass script for this stage. It does two targeted hooks in the unpacked image:
+
+```text
+sub_16190 called from sub_4E354+0x294:
+  return qword_8CEF8 so the integrity SipHash compare passes.
+
+sub_15DD4 called from sub_4E354+0x2E0:
+  force v52 output bytes to 8f f9 a6 be so the magic branch at 0x4E688 is skipped.
+```
+
+Run:
+
+```bash
+./frida17/bin/frida -U -f com.dexprotector.detector.envchecks -l bypass_dex_frida17.js
+```
 
 ---
 
@@ -1595,3 +1625,1335 @@ Find which check inside sub_4E354 returns nonzero and causes MessageGuardExcepti
 ```
 
 ---
+
+---
+
+## 28. `sub_3B4DC`, cached app path/package getters
+
+### `sub_3B4DC(link_map, fnName)`
+
+`sub_3B4DC` resolves a symbol from a **specific already-selected `link_map`**. It does not search the library name itself.
+
+Prototype-like:
+
+```c
+void *resolve_symbol_from_link_map(struct link_map *lm, const char *symbol_name);
+```
+
+Observed logic:
+
+```c
+ctx[128];
+if (parse_dynamic(ctx, lm->l_ld, lm->l_addr))
+    return lookup_symbol(ctx, symbol_name);
+return NULL;
+```
+
+`link_map` fields used:
+
+```text
+lm[0] = l_addr  // load bias / base
+lm[1] = l_name  // library path/name
+lm[2] = l_ld    // dynamic section
+lm[3] = l_next  // next loaded lib
+```
+
+Difference from `sub_3B614`:
+
+```text
+sub_3B614(libName, fnName)
+  walks r_debug->r_map to find libName first, then resolves fnName.
+
+sub_3B4DC(link_map, fnName)
+  assumes the target library link_map is already known, then resolves fnName.
+```
+
+Suggested names:
+
+```c
+sub_3B614 = manual_dlsym_from_r_debug
+sub_3B4DC = resolve_symbol_from_link_map
+sub_3AF24 = parse_elf_dynamic_for_symbol_lookup
+sub_3B238 = lookup_symbol_in_dynamic_context
+```
+
+### Cached path/package getters
+
+These are tiny getters over values cached earlier by `sub_374A0` from `ActivityThread.mBoundApplication.info` / `LoadedApk`.
+
+```asm
+sub_3747C:
+  ADRP X8, qword_8CA50
+  LDR  X0, [X8, qword_8CA50]
+  RET
+
+sub_37494:
+  ADRP X8, qword_8CA10
+  LDR  X0, [X8, qword_8CA10]
+  RET
+```
+
+Meanings:
+
+```c
+char *sub_3747C(void) { return qword_8CA50; } // LoadedApk.mAppDir
+char *sub_37494(void) { return qword_8CA10; } // LoadedApk.mPackageName
+```
+
+Earlier cache source in `sub_374A0`:
+
+```text
+qword_8CA50 = strdup(LoadedApk.mAppDir)
+qword_8CA10 = strdup(LoadedApk.mPackageName)
+qword_8CA58 = strdup(LoadedApk.mDataDir)
+```
+
+So in `sub_4E354`:
+
+```c
+v48 = sub_3747C(v47);  // v48 = app APK/source dir path, from LoadedApk.mAppDir
+v49 = sub_37494();     // v49 = package name, e.g. com.dexprotector.detector.envchecks
+```
+
+---
+
+## 29. `sub_59F40`: APK/source path + AssetManager consistency check
+
+`sub_59F40` is called from the hidden JNI entry `sub_4E354` after cached Java/Android objects are ready.
+
+Call shape in `sub_4E354`:
+
+```c
+appDir  = sub_3747C();   // qword_8CA50 = LoadedApk.mAppDir / APK source path
+pkgName = sub_37494();   // qword_8CA10 = LoadedApk.mPackageName
+ret = sub_59F40(appDir, pkgName, AAssetManager_ptr);
+```
+
+Meaning:
+
+```c
+int check_apk_asset_consistency(const char *appDir,
+                                const char *packageName,
+                                AAssetManager *amgr);
+```
+
+### Main purpose
+
+This is an anti-tamper / anti-repack check. It verifies that:
+
+1. `LoadedApk.mAppDir` looks like a valid APK/source path.
+2. For `/data/app`, `/mnt/expand`, `/mnt/asec`, the path contains `"/<packageName>-"`.
+3. The APK path matches the real target of `/proc/self/fd/<apk_fd>`.
+4. The file/inode behind the APK fd matches the path passed from Java state.
+5. `AAssetManager` can open a protected asset from the same APK file.
+
+Suggested rename:
+
+```c
+sub_59F40 = check_apk_asset_consistency
+```
+
+### Path prefix checks
+
+Decoded prefixes used by `sub_59F40`:
+
+```text
+/data/app/
+/mnt/expand/
+/mnt/asec/
+/vendor/
+/system/
+/preload/
+```
+
+For data-app style paths, it builds:
+
+```c
+needle = "/" + packageName + "-";
+```
+
+Example:
+
+```text
+/com.dexprotector.detector.envchecks-
+```
+
+Then it requires:
+
+```c
+strstr(appDir, needle) != NULL
+```
+
+If not found, return code is `118`.
+
+### `sub_5A4C8(appDir)` helper
+
+Suggested rename:
+
+```c
+sub_5A4C8 = verify_app_fd_path_inode
+```
+
+What it does:
+
+```text
+- get protected/app APK fd from internal state: *(int *)(sub_366B4() + 28)
+- fstat(fd)
+- build "/proc/self/fd/<fd>"
+- readlinkat(AT_FDCWD, "/proc/self/fd/<fd>", ...)
+- stat(real_fd_target)
+- compare device/inode from fstat vs stat
+- compare appDir string vs real fd target path
+```
+
+So it detects fake `LoadedApk.mAppDir`, fd swapping, or APK path mismatch.
+
+### `sub_5A640(AAssetManager*)` helper
+
+Suggested rename:
+
+```c
+sub_5A640 = verify_asset_manager_uses_same_apk_fd
+```
+
+What it does:
+
+```text
+- find libandroid.so link_map via sub_3B590("libandroid.so")
+- resolve symbols from that link_map using sub_3B4DC:
+  - AAssetManager_open
+  - AAsset_openFileDescriptor
+  - AAsset_close
+- decode protected asset name using sub_55610
+- open that asset through AAssetManager
+- get asset fd with AAsset_openFileDescriptor
+- fstat(asset_fd)
+- fstat(main_apk_fd)
+- compare device/inode
+```
+
+So it checks that Java `AssetManager` is really backed by the same APK/source file as the app fd.
+
+### Return codes observed
+
+```text
+0    OK
+108  appDir too short
+109  invalid/unknown source path prefix
+110  failed/too long package needle build
+111  /proc/self/fd or stat/fstat consistency check failed
+112  appDir string != real /proc/self/fd/<apk_fd> target
+114  AAssetManager_open failed
+115  AAsset_openFileDescriptor failed
+117  asset fd is not from same APK inode/device
+118  data-app style path does not contain "/<packageName>-"
+122  libandroid.so link_map not found
+123  AAsset* symbol resolution failed
+```
+
+
+---
+
+## 30. `sub_3601C` / `sub_3662C` block in `sub_4E354`
+
+Code in hidden JNI entry:
+
+```c
+v28 = sub_3601C();
+inited = v28;
+if (!(_DWORD)v28) {
+    v29 = sub_3747C(v28);
+    inited = sub_3662C(v29);
+}
+```
+
+Meaning:
+
+```c
+ret = init_runtime_version_offsets();
+if (ret == 0) {
+    appDir = get_cached_loaded_apk_app_dir();
+    ret = open_and_parse_app_apk_zip(appDir);
+}
+```
+
+### `sub_3601C` = initialize runtime-version dependent offsets
+
+Suggested rename:
+
+```c
+sub_3601C = init_runtime_art_dalvik_offsets
+```
+
+It reads the Android SDK/runtime version from `dword_8C9E0` via `sub_36600()` and initializes global offsets:
+
+```text
+qword_8C9B0
+qword_8C9B8
+qword_8C9C0
+qword_8C9D8
+off_8C9D0
+```
+
+For old Android / Dalvik path, `sdk <= 20`:
+
+```c
+qword_8C9B8 = 0x20;
+off_8C9D0 = manual_dlsym_from_r_debug("libdvm.so", "_Z15dvmUseJNIBridgeP6MethodPv");
+return off_8C9D0 ? 0 : 2;
+```
+
+For ART path, `sdk > 20`, it does not resolve `libdvm.so`. Instead it fills those globals with different offsets depending on SDK version. These are likely offsets into Android runtime internal structures such as `ArtMethod` / JNI bridge / entrypoint fields. They are version-specific because ART layout changes across Android releases.
+
+Return:
+
+```text
+0  OK
+2  old Dalvik path failed to resolve dvmUseJNIBridge
+```
+
+### `sub_3747C` = getter for cached APK path
+
+Disassembly:
+
+```asm
+ADRP X8, qword_8CA50
+LDR  X0, [X8, qword_8CA50]
+RET
+```
+
+Suggested rename:
+
+```c
+sub_3747C = get_cached_loaded_apk_app_dir
+```
+
+It returns `qword_8CA50`, cached earlier by `sub_374A0` from `LoadedApk.mAppDir` / APK source path.
+
+### `sub_3662C(appDir)` = open and parse APK as ZIP
+
+Suggested rename:
+
+```c
+sub_3662C = init_app_apk_zip_info
+```
+
+It allocates `0x20` bytes, then calls `sub_3C640(out, appDir)`.
+
+`sub_3C640` does:
+
+```text
+openat(AT_FDCWD, appDir, O_RDONLY)
+fstat(fd)
+mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0)
+scan backward for ZIP EOCD signature 0x06054b50
+read central-directory offset / size / entry count
+store APK ZIP metadata into the 0x20-byte struct
+```
+
+Struct layout written by `sub_3C640`:
+
+```c
+struct ApkZipInfo {
+    void    *mmap_base;      // +0x00
+    uint64_t file_size;      // +0x08
+    uint32_t cd_offset;      // +0x10
+    uint32_t cd_end;         // +0x14 = cd_offset + cd_size
+    uint32_t entry_count;    // +0x18
+    int      fd;             // +0x1c
+};
+```
+
+On success:
+
+```c
+qword_8C9E8 = apk_zip_info;
+return 0;
+```
+
+On failure:
+
+```text
+malloc failed -> 20
+ZIP/open/parse failed -> log/report code 9 + detail, then return 21
+```
+
+### Why this block exists
+
+This block prepares two things for later checks:
+
+1. Runtime layout offsets for ART/Dalvik-specific native/JNI checks.
+2. A memory-mapped view of the real app APK plus ZIP central-directory metadata.
+
+Later functions use this APK metadata for asset/APK integrity checks, including `sub_59F40` and `sub_5E684` / `ic.dat` verification.
+
+---
+
+## 31. `sub_15D88(&unk_89799, 32, &byte_8972C, 64, v54)`
+
+Call in `sub_4E354`:
+
+```c
+sub_15D88(&unk_89799, 32LL, &byte_8972C, 64LL, v54);
+```
+
+Wrapper logic:
+
+```c
+uint64_t sub_15D88(void *key, size_t key_len,
+                   void *msg, size_t msg_len,
+                   void *out32)
+{
+    desc = sub_29248(9);          // hash/PRF descriptor: alg id 9, digest 0x20, block 0x40
+    return sub_28AB4(desc, key, key_len, msg, msg_len, out32);
+}
+```
+
+`sub_28AB4/sub_29B54` implement an HMAC-like PRF using descriptor id `9`, i.e. SHA-256-like:
+
+```c
+out32 = HMAC_SHA256(key=unk_89799[0:32], msg=byte_8972C[0:64]);
+```
+
+Static inputs from the unpacked image:
+
+```text
+unk_89799[32]
+0247ac85e40b5de63c46ea3c5196a2f1c20c437bbda49fab0d09b5a90b8e1688
+
+byte_8972C[64]
+19afcbddc54d38e11f9f32c6d1e407434ecdc0af5a4ef612dd2b0ec92e4899fa9eec8cdb87aff11d0c8801e2c9910d4ad9143f05563844257c5140254a9f58d8
+```
+
+Expected output immediately after `sub_15D88` if those static inputs are unchanged:
+
+```text
+v54[32] = 68daae1f35ace64a551d7c5e7f293b5af12d8700c767c30854fd0c0155576f0c
+```
+
+Side effects:
+
+```text
+- Writes 32 bytes to output buffer v54.
+- Does not mutate unk_89799.
+- Does not mutate byte_8972C.
+- Allocates temporary hash/HMAC state internally, then wipes/frees it via sub_29278.
+```
+
+Important: this is only the initial crypto/check context. Immediately after this call, `sub_4E354` may further mutate `v54` with:
+
+```c
+if (byte_8972C & 1) sub_3CF84(v54);
+if (!(byte_8973C & 1)) sub_3DDB8(v54, value_from_byte_89770_73);
+sub_3E038(v54);
+```
+
+So `v54` after `sub_15D88` is not the final ctx/key used by `ic.dat`.
+
+---
+
+## 32. `sub_3CF84(v54)`
+
+Called in `sub_4E354` only when:
+
+```c
+if (byte_8972C & 1)
+    sub_3CF84(v54);
+```
+
+For this sample `byte_8972C[0] = 0x19`, so bit0 is set and this function runs.
+
+Suggested rename:
+
+```c
+sub_3CF84 = mix_apk_signature_into_crypto_context
+```
+
+### High-level purpose
+
+`sub_3CF84` mutates the 32-byte crypto/check context `v54` using information from the app APK signature. It ties the later key/context to the exact APK signing material.
+
+Input APK metadata comes from:
+
+```c
+apkInfo = sub_366B4(); // qword_8C9E8 from sub_3662C/open_and_parse_app_apk_zip
+```
+
+`apkInfo` contains APK mmap pointer, file size, central directory offset/end, entry count, fd.
+
+### Main control flow
+
+```c
+void sub_3CF84(uint8_t ctx[32]) {
+    apkInfo = qword_8C9E8;
+
+    if (apkInfo->entry_count < 4)
+        return; // ctx unchanged
+
+    if (sdk < 24)
+        return fallback_scan_META_INF_and_mix(ctx, apkInfo);
+
+    if (find_apk_signing_block_42(apkInfo, &sigBlock, &sigBlockSize) != 0)
+        return fallback_scan_META_INF_and_mix(ctx, apkInfo);
+
+    // Android P / API 28+ prefers APK Signature Scheme v3.
+    if (sdk >= 28 && mix_signing_scheme_block(ctx, sigBlock, sigBlockSize, 0xF05368C0))
+        return;
+
+    // Otherwise try APK Signature Scheme v2.
+    if (mix_signing_scheme_block(ctx, sigBlock, sigBlockSize, 0x7109871A))
+        return;
+
+    fallback_scan_META_INF_and_mix(ctx, apkInfo);
+}
+```
+
+Important IDs:
+
+```text
+0x7109871A = APK Signature Scheme v2 block id
+0xF05368C0 = APK Signature Scheme v3 block id
+```
+
+`sub_3CAA0` finds the APK Signing Block by checking the footer magic:
+
+```text
+"APK Sig Block 42"
+```
+
+### How `v54` changes
+
+`v54` is a 32-byte context. `sub_3CF84` does not simply XOR it. It repeatedly calls:
+
+```c
+sub_15E24(ctx, data, data_len, ctx);
+```
+
+`sub_15E24` means roughly:
+
+```c
+tmp = PRF_SHA256(ctx, constant_0x07FFCFC433E03432, 32);
+ctx = HMAC_SHA256(key=tmp, msg=data);
+```
+
+So every call to `sub_15E24` overwrites all 32 bytes of `v54` with a new derived value.
+
+### If v2/v3 signing block is found: `sub_3D034`
+
+`sub_3D034(ctx, sigBlock, sigBlockSize, blockId)`:
+
+1. Finds the v2/v3 block inside APK Signing Block.
+2. Parses signer/certificate/digest records.
+3. Computes SHA-256 hashes over selected signature/cert data using `sub_320B4`.
+4. Sorts 32-byte hashes with `sub_3DB90`.
+5. Computes a combined 32-byte digest `v29`.
+6. Mixes static table and matching derived values into `ctx`:
+
+```c
+sub_15E24(ctx, &unk_89452, 240, ctx);
+
+for each 40-byte marker in:
+    unk_89452
+    unk_8947A
+    unk_894A2
+    unk_894CA
+    unk_894F2
+    unk_8951A
+{
+    if (sub_160FC(v29, marker, 40, tmp32, 32) == 0)
+        sub_15E24(ctx, tmp32, 32, ctx);
+}
+```
+
+Return `1` means it found and processed the requested signing block. Return `0` means not found/invalid.
+
+### Fallback path: `sub_3D47C`
+
+If APK Signing Block is missing/invalid, or v2/v3 data cannot be used, `sub_3D47C` scans ZIP central-directory entries under:
+
+```text
+META-INF/
+```
+
+It looks for signature/certificate-style files such as `.RSA`, `.DSA`, `.EC`, `.SF`, hashes/decompresses relevant entries, then performs a similar `sub_15E24` mixing sequence.
+
+### Side effects
+
+Persistent side effect:
+
+```text
+v54[0:32] is overwritten one or more times.
+```
+
+No persistent mutation expected for:
+
+```text
+unk_89799
+byte_8972C
+APK mmap contents
+qword_8C9E8
+```
+
+Temporary buffers are wiped locally.
+
+### Why this matters
+
+After `sub_15D88`, `v54` is purely static-derived. After `sub_3CF84`, `v54` becomes APK-signature-derived. If APK signing data differs, or if this function is skipped/spoofed incorrectly, later checks fail:
+
+```text
+sub_15DD4 magic check may output wrong 4 bytes
+sub_5E684 ic.dat decrypt/auth can fail with 714
+```
+
+### Practical note: effect of repacking
+
+For `sub_3CF84`, if the APK is the original/unmodified package and is not repacked/resigned, this step should be stable and should not cause failure by itself.
+
+Reason:
+
+```text
+sub_3CF84 derives/mixes v54 from the APK signing material.
+Original APK signing block / META-INF signature data unchanged => same derived v54.
+```
+
+If the app is repacked or resigned, the APK Signature Scheme v2/v3 block or `META-INF/*` signature files change. Then `sub_3CF84` derives a different `v54`, causing later checks to fail, commonly:
+
+```text
+sub_15DD4 magic mismatch
+sub_5E684 / ic.dat decrypt-auth fail, e.g. 714
+APK/asset integrity mismatch
+```
+
+So for dynamic Frida analysis on the original installed APK, `sub_3CF84` itself is usually safe. The bigger risk is not repacking, but Frida hooks that patch code pages before later context derivation such as `sub_3E038`.
+
+---
+
+## 33. `sub_3DDB8(v54, 1)`
+
+Called in `sub_4E354` after `sub_3CF84` only when:
+
+```c
+if (!(byte_8973C & 1)) {
+    uint32_t n = byte_89770 | byte_89771 << 8 | byte_89772 << 16 | byte_89773 << 24;
+    sub_3DDB8(v54, n);
+}
+```
+
+For this sample:
+
+```text
+byte_8973C = 0x4e  => bit0 clear, so the call runs
+byte_89770..73 = 01 00 00 00 => n = 1
+```
+
+So actual call is:
+
+```c
+sub_3DDB8(v54, 1);
+```
+
+Suggested rename:
+
+```c
+sub_3DDB8 = mix_dex_file_content_into_crypto_context
+sub_3DF04 = mix_zip_entry_prefix_into_crypto_context
+```
+
+### High-level purpose
+
+This step mutates the 32-byte context `v54` using APK DEX file content.
+
+It gets APK ZIP metadata from:
+
+```c
+apkInfo = sub_366B4(); // qword_8C9E8
+```
+
+Then it tries to process:
+
+```text
+classes.dex
+classes2.dex
+classes3.dex
+...
+classesN.dex
+```
+
+where `N` is the second argument.
+
+In our case `N = 1`, so only this is processed:
+
+```text
+classes.dex
+```
+
+### Flow
+
+```c
+bool ok = sub_3DF04(v54, apkInfo, "classes.dex");
+
+if (!ok) {
+    sub_15E24(v54, "1", 1, v54);
+    return;
+}
+
+for (i = 2; i <= N; i++) {
+    name = "classes" + i + ".dex";
+    if (!sub_3DF04(v54, apkInfo, name))
+        break;
+}
+```
+
+Because `N = 1`, the loop for `classes2.dex` is skipped.
+
+### What `sub_3DF04` mixes
+
+`sub_3DF04(ctx, apkInfo, zipEntryName)`:
+
+1. Finds the ZIP central-directory entry by name.
+2. Resolves the local file data pointer.
+3. If entry is compressed with ZIP method 8 / deflate:
+   - decompresses up to first `min(uncompressed_size, 0x400)` bytes.
+   - mixes those bytes into `ctx`.
+4. If entry is stored/uncompressed:
+   - mixes first `min(size, 0x400)` bytes directly.
+5. If lookup/decompress fails:
+   - mixes single byte ASCII `'1'` into `ctx`.
+
+The mixing operation is again:
+
+```c
+sub_15E24(ctx, data, data_len, ctx);
+```
+
+Meaning `v54[0:32]` is overwritten with a new derived 32-byte value.
+
+### Side effects
+
+Persistent side effect:
+
+```text
+v54[0:32] changes.
+```
+
+No persistent change to:
+
+```text
+APK mmap
+qword_8C9E8
+byte_89770..73
+byte_8973C
+```
+
+### Practical meaning
+
+This binds the crypto/check context to the DEX content in the APK. If `classes.dex` changes because the app is repacked/rebuilt, then `v54` changes and later checks can fail.
+
+For original APK without repacking, this step should be deterministic and stable.
+
+---
+
+## 34. `sub_3E038(v54)`
+
+Called after the static/APK-signature/DEX-content context mixing:
+
+```c
+sub_3E038(v54);
+```
+
+Suggested rename:
+
+```c
+sub_3E038 = mix_hidden_native_image_integrity_into_crypto_context
+```
+
+### What it checks
+
+This function checks / fingerprints the unpacked hidden native image in memory, not the Java APK repack state.
+
+It starts from the 16KB page containing `loc_3E064`:
+
+```c
+page = align_down(&loc_3E064, 0x4000); // hidden_base + 0x3c000 in this sample
+```
+
+Then scans backward by `0x4000` bytes until it finds the custom image header:
+
+```text
+header[0..3] == 00 00 00 00
+header[0x0b] == 0x0b
+header[0x3f] == 0x0e
+```
+
+In our dumped hidden image this header is at:
+
+```text
+hidden_base + 0x0
+```
+
+The header encodes a protected length using weird byte positions:
+
+```c
+protected_len = header[0x17] | header[0x1d] << 8 | header[0x25] << 16;
+```
+
+For this sample:
+
+```text
+protected_len = 0x7caa0
+```
+
+Then it computes a 32-byte digest over:
+
+```text
+hidden_base + 0x0 ... hidden_base + 0x7caa0
+```
+
+using `sub_320B4`.
+
+### How it mutates `v54`
+
+After digesting the hidden image region into `v8[32]`, it calls:
+
+```c
+sub_160FC(v8, &unk_89543, 40, tmp32, 32)
+```
+
+Static blob:
+
+```text
+unk_89543[40] =
+0f9f4d727950837d81b7cf2231e275c7076a1879d0db0a398343d03261f3c8224c4102edfb4f40ac
+```
+
+If `sub_160FC` succeeds:
+
+```c
+sub_15E24(v54, tmp32, 32, v54);
+```
+
+So the persistent effect is:
+
+```text
+v54[0:32] is overwritten with a new derived value based on hidden native image bytes.
+```
+
+If the custom header is not found, it falls back to mixing byte ASCII `'z'`:
+
+```c
+sub_15E24(v54, "z", 1, v54);
+```
+
+If `sub_160FC` fails, it wipes temp buffers and logs/report code `12` via `sub_656C0(12)`.
+
+### Why this matters for Frida
+
+Unlike `sub_3CF84` and `sub_3DDB8`, this is not about APK repack/signature. It hashes the unpacked native image currently mapped in process memory.
+
+Therefore hooks installed before `sub_3E038` can affect the digest if Frida patches any instruction inside:
+
+```text
+hidden_base + 0x0 .. hidden_base + 0x7caa0
+```
+
+This includes most hidden functions and the `sub_4E354` callsites. If those bytes differ, the derived `v54` can differ, causing later failures such as:
+
+```text
+sub_15DD4 magic mismatch
+sub_5E684 ic.dat decrypt-auth fail 714
+```
+
+Practical rule:
+
+```text
+Before sub_3E038: avoid patching/hooking inside hidden_base+0x0..0x7caa0.
+After sub_3E038: safer to install hooks needed for dumping/decrypt tracing.
+```
+
+---
+
+## 35. Runtime-clean hash bypass result: `sub_3E038`, `sub_16190`, `sub_15DD4`, `ic.dat`
+
+Latest working observation:
+
+```text
+runtime clean sub_3E038 digest =
+fce5f155a916bccade80a9c585c98f55064e0918095592ad4754aea5932a8696
+```
+
+This digest must be computed at runtime after hidden image is executable, right before outer JNI_OnLoad calls hidden entry:
+
+```asm
+outer libdexprotector.so+0x464  LDR X8, [X19,#0x230]   ; hidden entry = hidden_base+0x4E354
+outer libdexprotector.so+0x468  BLR X8
+```
+
+Computing at `sub_167C onLeave` was too early:
+
+```text
+compute failed: access violation accessing hidden+0x320b4
+```
+
+At `outer JNI_OnLoad+0x468`, calling hidden `sub_320B4(hidden_base, 0x7caa0, out, 0)` works and gives the correct runtime digest. Static file hash from `dumps/unpacked_image_relocated_hybrid.bin[0:0x7caa0]` was wrong for this check.
+
+Then the one-shot `sub_320B4` hook inside `sub_3E038` forces that runtime-clean digest:
+
+```text
+[sub_320B4/sub_3E038 force digest]
+clean=fce5f155a916bccade80a9c585c98f55064e0918095592ad4754aea5932a8696
+source=runtime-clean
+```
+
+`sub_160FC` accepts this digest. `sub_3E038` no longer returns error code `0xc`.
+
+---
+
+### Clean `sub_16190` hash
+
+At the same clean point, compute:
+
+```c
+sub_16190(hidden_base + 0x10E00, 0x663E8, zero_key16)
+```
+
+Observed clean hash:
+
+```text
+runtime clean sub_16190 hash = 0xfc920bfb67d0075a
+```
+
+This matches runtime `qword_8CEF8`:
+
+```text
+qword_8CEF8 = 0xfc920bfb67d0075a
+```
+
+Mid-block hook at `0x4E5E8` was fragile and caused crashes. Better method:
+
+1. Precompute clean `sub_16190` hash before hidden hooks.
+2. Hook `sub_16190` function entry after hidden hooks.
+3. Only spoof the protected-code call:
+
+```text
+args:
+  data = hidden_base + 0x10E00
+  len  = 0x663E8
+  key  = zero16 stack key
+return:
+  0xfc920bfb67d0075a
+```
+
+Observed:
+
+```text
+[sub_16190 spoof protected]
+real=0xd895851a9f63e78e -> 0xfc920bfb67d0075a
+```
+
+This avoids the poison path:
+
+```c
+sub_15E24(v54, "\0", 1, v54);
+```
+
+---
+
+### `v54` now verified correct
+
+With runtime-clean `sub_3E038` digest and protected-call `sub_16190` spoof, `sub_15DD4` does not need spoofing.
+
+Observed:
+
+```text
+[sub_15DD4 actual]
+v54=2fb0981db149168fce51e77f4a152d94b020089cd7c5f5b65bf3dc21a7b565d4
+input=5994656b07fba491
+out=8ff9a6be
+expected=8ff9a6be
+v54_ok=true
+```
+
+Conclusion:
+
+```text
+v54 is now correct before sub_15DD4.
+```
+
+`sub_15DD4` is only verifier/PRF output; it does not mutate `v54`.
+
+---
+
+### `ic.dat` decrypt/decompress result
+
+With correct `v54`, `sub_5E684` successfully decrypts and decompresses `assets/ic.dat`.
+
+Observed:
+
+```text
+[ic.dat decrypt leave] ret=0
+[ic.dat decrypted] decomp_size=0xd2 comp_size=0x8b
+[ic.dat decompress leave] written=0xd2 expected=0xd2
+```
+
+Dumped files on device:
+
+```text
+/data/data/com.dexprotector.detector.envchecks/files/ic_dat_dumps/ic_raw_encrypted_asset.bin
+/data/data/com.dexprotector.detector.envchecks/files/ic_dat_dumps/ic_decrypted_with_size_and_compressed.bin
+/data/data/com.dexprotector.detector.envchecks/files/ic_dat_dumps/ic_decrypted_compressed_payload.bin
+/data/data/com.dexprotector.detector.envchecks/files/ic_dat_dumps/ic_decompressed.bin
+```
+
+Parsed `ic_decompressed.bin`:
+
+```text
+siphash_key16=d4278b9ed41c9d789b9120c2348f6f3a
+expected_hash=3263391480026587514
+entry_count=10
+```
+
+Listed entries:
+
+```text
+assets/chinook.db
+assets/classes.dex.dat
+assets/dp.arm-v7.so.dat
+assets/dp.mp3
+assets/dp_db.mp3
+assets/ict.dat
+assets/rcdb.dat
+assets/resources.dat
+assets/se.dat
+classes.dex
+```
+
+Current remaining failure:
+
+```text
+[sub_5E684 leave] ret=0x2db (731)
+```
+
+Meaning:
+
+```text
+ic.dat decrypt/decompress passes, but later APK entry integrity/hash verification fails.
+```
+
+Next likely target:
+
+```text
+Reverse the post-decompress loop inside sub_5E684 that uses the decompressed entry list, CRC values, and siphash_key16. Bypass or satisfy final expected_hash compare.
+```
+
+## 2026-05-13 — `sub_5E684` / `ic.dat` CRC verification results
+
+New CRC tracing was added to `hook_dump_ic_dat_frida17.js`:
+
+- `sub_5E684`
+  - logs CRC32 values read from APK ZIP central directory for entries listed in decrypted/decompressed `ic.dat`.
+  - logs final SipHash compare over the CRC32 array.
+- `sub_5F0D0`
+  - logs path recovered from `qword_8CEF0 -> sub_4E348() -> sub_3C0EC(... /proc/self/maps ...)`.
+  - logs native-lib CRC path if reached.
+- `sub_5F46C`
+  - logs real native-lib file path, expected CRC32, computed CRC32 from `sub_771EC()`.
+
+Important fix: our Frida hook on hidden `sub_4E354` perturbs LR, so `qword_8CEF0` may be saved as a Frida/anonymous return address. `sub_5F0D0` then cannot recover the outer libdexprotector path and returns `731`. The script now restores:
+
+```text
+qword_8CEF0 = outer libdexprotector.so base + 0x46c
+```
+
+Observed after fix:
+
+```text
+[ic.dat parsed]
+siphash_key16 = d4278b9ed41c9d789b9120c2348f6f3a
+expected_hash = 0x2d49e542ca05617a
+entry_count   = 10
+
+CRC entries from APK central directory:
+0 assets/chinook.db          crc=0xccf2ef83
+1 assets/classes.dex.dat     crc=0x3e86695c
+2 assets/dp.arm-v7.so.dat    crc=0x571bcdd6
+3 assets/dp.mp3              crc=0x89858e35
+4 assets/dp_db.mp3           crc=0x2a1c341b
+5 assets/ict.dat             crc=0x313cfab9
+6 assets/rcdb.dat            crc=0xd2ecba0e
+7 assets/resources.dat       crc=0x88b8abe6
+8 assets/se.dat              crc=0x8bf989a4
+9 classes.dex                crc=0x5c81defc
+
+SipHash over CRC array:
+expected = 0x2d49e542ca05617a
+computed = 0x2d49e542ca05617a
+match    = true
+```
+
+Conclusion: `ic.dat` decrypt/decompress is correct, and the APK CRC/SipHash check inside `sub_5E684` passes.
+
+`sub_5F0D0` behavior:
+
+```text
+[sub_5F0D0 path] ".../split_config.arm64_v8a.apk"
+[sub_5F0D0 strlen] last4=".apk"
+[sub_5F0D0 SUCCESS] returning 0
+```
+
+This is expected. If the mapped outer lib path ends with `.apk`, protector assumes the native library is loaded directly from the APK/split APK, so it skips native extracted-file CRC thread setup and returns success. The native-file CRC path (`sub_5F364 -> sub_5F46C`) is only used when the native lib path is an extracted `.so` file rather than an APK path.
+
+Therefore current termination after this point is not caused by `sub_5E684`/`sub_5F0D0` failure. Next suspected phase is after returning to `sub_4E354`, especially final handoff:
+
+```c
+sub_4EB9C(env, v54, AAssetManager*)
+```
+
+Next hooks to add if needed:
+
+- `sub_5E684` leave
+- `sub_4EB9C` enter/leave
+- `sub_4E7D8` MessageGuardException path
+- libc/syscall exits: `exit`, `exit_group`, `abort`, `kill`, `tgkill`
+
+
+## 2026-05-13 — `sub_4EB9C(env, v54, AAssetManager*)` final gate / Java bootstrap
+
+`sub_4EB9C` is the phase immediately after `sub_5E684(v54)` succeeds. It is not the original unpacker. It is the final protector gate plus Java/bootstrap setup.
+
+High-level shape:
+
+```c
+int sub_4EB9C(JNIEnv *env, uint8_t *v54, AAssetManager *am) {
+    err = sub_58DF8();              // binder / service manager init
+    if (!err) {
+        pkg_err = sub_592A4(env);   // PackageManager transaction/method ids
+        ks_err  = sub_59764(env);   // Keystore transaction ids
+        err = ks_err ? ks_err : pkg_err;
+    }
+
+    if (err && err != 404) {
+        sub_656C0(15);
+        sub_656C0(0);
+        sub_656EC(&err, 2);
+        return err;
+    }
+
+    byte_8CEE8 = 1;                 // sensitive-check phase
+    /* debugger/root/emulator/xposed/container/installer checks */
+    byte_8CEE8 = 0;
+
+    return sub_4EFB0(env, v54, am); // final Java payload/bootstrap
+}
+```
+
+### First half: environment gates
+
+| Call | Meaning |
+|---|---|
+| `sub_58DF8()` | Binder init: opens `/dev/binder`, checks binder version, mmaps binder buffer, resolves IServiceManager transaction ids. `404` is tolerated as non-fatal. |
+| `sub_592A4(env)` | Resolve PackageManager methods/transactions: `getPackageInfo`, `getPackageUid`, `UserHandle.myUserId`. |
+| `sub_59764(env)` | Resolve Keystore transaction ids: `getSecurityLevel` / old hardware-backed keystore checks. |
+| `sub_5AFF8()` | `/proc/self/status` `TracerPid` check, installs `pthread_atfork`, spawns anti-debug monitor thread. |
+| `sub_59B60(env)` | Java debugger check via `dalvik/system/VMDebug.isDebuggerConnected()`, plus anti-hook sanity. |
+| `sub_5B59C()` | Misc environment check; returns `776` on detected condition. |
+| `sub_652F8()` | Generic root/hooking check stage. |
+| `sub_675E8(env, context)` | UID / app ownership / package path consistency checks. Also checks container-ish properties. |
+| `sub_67E44(env)` | Xposed-style Java class checks. |
+| `sub_5B5B8()` | Emulator/cloud/Raspberry property checks. |
+| `sub_6531C()` | Installed root/Xposed/LuckyPatcher/Substrate/RootCloak style package checks. |
+| `sub_5BA64(&flags)` | Custom ROM/property checks: Lineage, MIUI, YunOS, etc. Sets category flags. |
+| `sub_67C08()` | Docker/container checks: `/.dockerenv` and related signals. |
+| `sub_68738()` | Xposed package/file checks: installer, `XposedBridge.jar`, `xposed.prop`, `libxposed_*`. |
+| `sub_5B740()` | Emulator file/proc checks: qemu, vbox, nox, goldfish, virtio, Memu, Redfinger, Raspberry. |
+| `sub_6539C()` | Root binary/path checks: `su`, `daemonsu`, `supolicy`, `/su/su`, `PATH` search. |
+| `sub_5F5A8(env, blob, flag, &flags)` | Optional attestation/timing/env check if corresponding config flags are enabled. |
+| `sub_687B8()` | Drozer package check: `com.mwr.dz`. |
+| `sub_66B78(env, context)` | Installer package check. Observed expected/interesting string: `com.google.android.packageinstaller`. |
+
+Many failures call `sub_65B2C(mask)` to record category bits. Some are hard-fail depending on config flags; some are logged then ignored by zeroing the local error.
+
+Important flag behavior in the current dump:
+
+```text
+byte_8973A bit0 = 1  debug checks strict
+byte_89747 bit0 = 1  emulator checks strict
+byte_89744 bit0 = 1  root/custom-ROM checks strict and optional extra gate
+byte_8974A bit0 = 1  Xposed checks strict
+byte_89748 bit0 = 0  installer check may be ignored after ExceptionCheck handling
+byte_89746 bit0 = 0  final soft-detect gate behavior
+```
+
+### Second half: `sub_4EFB0(env, v54, assetManager)`
+
+`sub_4EFB0` is the final bootstrap. It creates an `int[8]`, loads/decrypts a hidden Java class, lets Java fill that int array, mixes those 32 bytes into `v54`, then runs feature modules keyed from the updated `v54`.
+
+Core flow:
+
+```c
+jintArray arr = env->NewIntArray(8);
+err = sub_4F44C(env, arr);
+if (err) return err;
+
+raw32 = env->GetPrimitiveArrayCritical(arr, NULL); // int[8] = 32 bytes
+sub_15E24(v54, raw32, 32, v54);                    // mix Java-provided material into v54
+wipe(raw32_copy);
+
+for each enabled feature flag:
+    sub_15EC8(v54, out32, &constant64, 8);          // derive per-feature token
+    err = feature_init(env, out32, ...);
+    if (err) return err;
+```
+
+### `sub_4F44C(env, intArray)` hidden Java class loader
+
+Observed decoded strings / behavior:
+
+```text
+static field name: "BHbHm"
+static field sig : "[B"
+hidden class     : "com/dexprotector/detector/envchecks/ProtectedApplication$ProtectedApplication"
+method sig       : "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+native name      : "AgqpckdwFG"
+native sig       : "()[B"
+static method    : "hcrnly"
+static sig       : "([I)V"
+```
+
+`sub_4F44C` steps:
+
+1. Finds static byte array field `BHbHm:[B` on a cached protector class.
+2. Reads the byte array:
+   - first 32 bytes = key/material,
+   - remaining bytes = encrypted payload.
+3. Derives a decrypt context with `sub_15F44(first32, 32, byte_8972C, 64, ctx)`.
+4. Calls `sub_3E8E8(...)` to decrypt/load the hidden Java class.
+5. Finds class `ProtectedApplication$ProtectedApplication`.
+6. Finds method `h(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;` (`unk_479F` currently decodes to `"h"`) and caches it via `sub_35F94`.
+7. Registers native method `AgqpckdwFG()[B -> sub_4F87C`.
+8. Finds static method `hcrnly([I)V` and calls it with the `int[8]` created by `sub_4EFB0`.
+
+`sub_4F87C` returns a fixed 32-byte Java byte array:
+
+```text
+9fbf0eec3d806d8f074a6e441a415ceafb6578c75a816cc848198a9eb7add22d
+```
+
+This is likely one side of a native<->Java key handshake. The Java method then writes 8 ints back into `intArray`, and native folds those 32 bytes into `v54`.
+
+### Feature modules called from `sub_4EFB0`
+
+Each enabled module uses:
+
+```c
+sub_15EC8(v54, out32, &constant64, 8);
+```
+
+then passes `out32` to a feature init/check function.
+
+Current dump flag state:
+
+| Flag | Bit0 | Constant | Call | Meaning / guess |
+|---|---:|---:|---|---|
+| `byte_89730` | 1 | `0x873552BC11E8FF0E` | `sub_3EB6C(env,out32)` | Decrypt/load class chunks from asset id 5. Uses decoded asset-ish base `DF3FC58E29EAE0954C17E32FAEA140B4673FA808B877CB0E6F421373563DFC96` and suffix `/classesN`. |
+| `byte_8972D` | 1 | `0xF9A939C6FCAE9717` | `sub_402E0(env,out32, byte_89738&1)` | Decrypt/decompress asset id 4, load class/payload, optionally do provider-related follow-up. |
+| `byte_8973D` | 1 | `0xE196DE1BC97AB57A` | `sub_55718(env,out32)` | Init encrypted string table and register native `s(Ljava/lang/String;)Ljava/lang/String;`. |
+| `byte_89745` | 1 | none | `sub_65B50(env)` | Setup `ProtectedApplication$ProtectedApplication$QrGen$Segment`, register native helpers, cache ctor/field refs. |
+| `byte_89741` | 0 | `0x6F988B15B1F4EEF1` | `sub_66480(env,out32)` | Disabled in this dump. |
+| `byte_8972E` | 1 | `0xE5CADA586D49689A` | `sub_51E4C(env, context, out32)` | Cache `Context.getAssets()`, `AssetManager.openNonAsset(String)`, `NullPointerException`, `Class.getName()`, register native `ylGi(Object,String):InputStream`. |
+| `byte_89736` | 0 | `0x37265C912A43CDAC` | `sub_53B24(env,out32)` | Disabled in this dump. |
+| `byte_8972F` | 1 | `0x9F5ADC9EE0B3913B` | `sub_53390(env,out32)` | Decrypt asset id 2 and initialize another runtime blob/global area. |
+| `byte_89739` | 0 | `0xA68765019986F10B` | `sub_4FF68(env,out32)` | Disabled in this dump. |
+| `byte_89737` | 0 | `0xEC1AAD7D6B3AA721` | `sub_56578(env,out32)` | Disabled in this dump. |
+| `byte_89749`/`byte_89742` | 0/0 | `0x27673C669A996999` | `sub_3A6A0`, `sub_3A404(out32)` | Disabled in this dump. |
+| always | - | none | `sub_51A10(env, assetManager)` | Cache native `AAssetManager*`; tries `com/tns/AssetExtractor.extractAssets(String,String,String,Z)V`; if class missing, clears exception and still returns success. |
+| `byte_89743` | 0 | none | `sub_56134(env)` | Disabled in this dump. |
+| `byte_8973E` | 0 | none | `sub_3E188(env)` | Disabled in this dump. |
+| `byte_89731` | 1 | none | `sub_35BE8(env)` | Calls static method on `ProtectedApplication$R$string`: decoded signature `(Landroid/content/Context;)V`; decoded method name appears as `"a"`. |
+
+### Overall conclusion
+
+`sub_4EB9C` is best renamed to:
+
+```text
+final_env_gate_and_java_payload_bootstrap
+```
+
+`sub_4EFB0` is best renamed to:
+
+```text
+load_hidden_java_payload_mix_v54_and_init_features
+```
+
+If the app terminates after `sub_5E684`/`sub_5F0D0` success, the next likely failing point is one of the return values inside `sub_4EB9C`/`sub_4EFB0`, especially one of the enabled feature modules above. Next useful hook: log callsite return values at `sub_4EB9C` and `sub_4EFB0` after each `BL`, plus hook `sub_4E7D8` for final MessageGuardException code.
+
+## 2026-05-13 — `sub_4EB9C` / `sub_4EFB0` reachability and `0x2e` failure
+
+After disabling fragile post-`sub_5F0D0` PC/callsite hooks:
+
+```text
+[sub_5E684 leave] ret=0x0 (0)
+[HIT sub_4EB9C] env=... v54=... assetManager=... caller=hidden+0x4e7c8
+[HIT sub_4EFB0] env=... v54=... assetManager=... caller=hidden+0x4ef98
+```
+
+Conclusion:
+
+- `ic.dat` decrypt/decompress/check path is good.
+- `sub_5E684()` succeeds and returns `0`.
+- `sub_5F0D0()` is not the failing check.
+- Earlier crashes around `sub_5F0D0` were caused by our overly tight instruction/callsite hooks inside/after `sub_5F0D0`.
+- Execution reaches `sub_4EB9C()` and then `sub_4EFB0()`.
+
+Observed failure:
+
+```text
+[LEAVE sub_4EFB0] ret=0x2e signed=46 FAIL
+[LEAVE sub_4EB9C] ret=0x2e signed=46 FAIL
+```
+
+Initial hypothesis was that `0x2e` came from a pending Java exception immediately after `NewIntArray(8)`, because `sub_4EFB0` has early return blocks:
+
+```asm
+0x4efd8  JNIEnv->NewIntArray(8)
+0x4efec  JNIEnv->ExceptionCheck()
+0x4eff8  mov w0, #0x2e   ; if exception pending
+
+0x4f018  sub_4F44C(env, intArray)
+0x4f02c  JNIEnv->ExceptionCheck()
+0x4f038  mov w0, #0x2e   ; if exception pending
+
+0x4f064  JNIEnv->GetIntArrayElements(...)
+0x4f078  JNIEnv->ExceptionCheck()
+0x4f084  mov w0, #0x2e   ; if exception pending
+```
+
+Runtime probe showed this hypothesis is false for the first three checks:
+
+```text
+[JNI NewIntArray enter] len=8 caller=hidden+0x4efdc
+[JNI NewIntArray leave] ret=0x76dba740ad
+[JNI ExceptionCheck leave] ret=0x0 signed=0 caller=hidden+0x4eff0
+[JNI ExceptionCheck leave] ret=0x0 signed=0 caller=hidden+0x4f030
+[JNI ExceptionCheck leave] ret=0x0 signed=0 caller=hidden+0x4f07c
+```
+
+So `sub_4EFB0` continues beyond the initial Java array setup, then some later module returns `46`.
+
+Current script state:
+
+- `TRACE_AFTER_SUB5F0D0 = false`
+- `TRACE_SUB5F0D0_INTERNALS = false`
+- only function-level hooks around `sub_4EB9C`, `sub_4EFB0`, JNI `NewIntArray`, JNI `ExceptionCheck`, and `sub_4EFB0` child functions.
+- no fragile mid-basic-block hooks after `sub_5F0D0`.
+
+Next step:
+
+Run the updated script and inspect child function logs:
+
+```text
+[child enter #x] <name> ...
+[child leave #x] <name> ret=... signed=...
+```
+
+Whichever child first returns `0x2e / 46` is the failing module inside `sub_4EFB0`.
+

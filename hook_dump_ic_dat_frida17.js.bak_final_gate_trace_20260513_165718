@@ -1,0 +1,1064 @@
+'use strict';
+
+/*
+ * Frida 17.x: dump DexProtector assets/ic.dat after decrypt and after decompress.
+ *
+ * Run:
+ *   ./frida17/bin/frida -U -f com.dexprotector.detector.envchecks \
+ *     -l hook_dump_ic_dat_frida17.js
+ *
+ * Dumps on device:
+ *   /data/data/com.dexprotector.detector.envchecks/files/ic_dat_dumps/
+ *
+ * Pull example:
+ *   adb shell 'run-as com.dexprotector.detector.envchecks ls -l files/ic_dat_dumps'
+ *   adb shell 'run-as com.dexprotector.detector.envchecks cat files/ic_dat_dumps/ic_decompressed.bin' > dumps/ic_decompressed.bin
+ */
+
+const TARGET_LIB = 'libdexprotector.so';
+const TARGET_INIT_RVA = ptr('0x378');
+
+// Outer libdexprotector.so RVAs.
+const DP_SUB_918_RVA = ptr('0x918');
+const DP_SUB_918_VM_RAW_COPIED_RVA = ptr('0xc98');
+const DP_SUB_918_FINAL_RVA = ptr('0xd34');
+const DP_SUB_167C_RVA = ptr('0x167c');
+const DP_JNI_ONLOAD_CALL_HIDDEN_RVA = ptr('0x468'); // outer JNI_OnLoad: BLR hidden_entry, LR becomes +0x46c
+const DP_JNI_ONLOAD_RET_AFTER_HIDDEN_RVA = ptr('0x46c');
+const SPOOF_RBRK_BYTES = [0xc0, 0x03, 0x5f, 0xd6]; // ARM64 RET instruction bytes.
+const SPOOF_OUTER_KEY = true;
+
+// Hidden unpacked-image RVAs.
+const H_SUB_4E354_RVA = ptr('0x4e354'); // hidden native entry called by ProtectedApplication.ye
+const H_SUB_4E7D8_RVA = ptr('0x4e7d8'); // common MessageGuardException/error path: (env, error_code)
+const H_QWORD_8CEF0_RVA = ptr('0x8cef0'); // saved caller LR / outer return address
+const CS_AFTER_STORE_QWORD_8CEF0 = ptr('0x4e37c'); // after STR X30, [qword_8CEF0]
+const H_SUB_5E684_RVA = ptr('0x5e684'); // check_apk_integrity_from_ic_dat(ctx)
+const H_SUB_54944_RVA = ptr('0x54944'); // open/read protected asset by id; id 6 = ic.dat
+const H_SUB_160FC_RVA = ptr('0x160fc'); // derive/decrypt blob from hidden-image digest
+const H_SUB_20754_RVA = ptr('0x20754'); // AEAD decrypt/auth helper used by sub_5E684
+const H_SUB_320B4_RVA = ptr('0x320b4'); // hash helper used by sub_3E038(hidden_base, 0x7caa0, out, 0)
+const H_SUB_71844_RVA = ptr('0x71844'); // inflate/decompress helper used by sub_5E684
+const H_THREAD_5CB5C_RVA = ptr('0x5cb5c'); // watchdog thread start used by sub_5CB1C
+const H_THREAD_5D730_RVA = ptr('0x5d730'); // watchdog thread start used by sub_5D6F0
+
+// Bypass checks that our Frida hooks disturb before sub_5E684 is reached.
+const H_SUB_16190_RVA = ptr('0x16190');
+const H_CALLER_RET_AFTER_SUB16190_RVA = ptr('0x4e5e8');
+const H_QWORD_8CEF8_RVA = ptr('0x8cef8');
+const H_SUB_15DD4_RVA = ptr('0x15dd4');
+const H_CALLER_RET_AFTER_SUB15DD4_RVA = ptr('0x4e638');
+const EXPECTED_MAGIC_4E354 = [0x8f, 0xf9, 0xa6, 0xbe];
+const H_PROTECTED_CODE_START_RVA = ptr('0x10e00');
+const H_PROTECTED_CODE_END_RVA = ptr('0x771e8');
+
+// Safe call-site RVAs inside sub_4E354. These are in page 0x4c000/0x4e000,
+// not in the 0x3e038 self-key scan range. Prefer these over hooking low helper funcs.
+const CS_AFTER_SUB3B6D8   = ptr('0x4e424');
+const CS_AFTER_SUB363F0   = ptr('0x4e434');
+const CS_AFTER_SUB5E38C   = ptr('0x4e468');
+const CS_AFTER_SUB63EA8   = ptr('0x4e4b0');
+const CS_AFTER_SUB5CB1C   = ptr('0x4e4f0');
+const CS_AFTER_SUB5D6F0   = ptr('0x4e4f8');
+const CS_AFTER_SUB3601C   = ptr('0x4e514');
+const CS_AFTER_SUB3662C   = ptr('0x4e524');
+const CS_AFTER_SUB3E038   = ptr('0x4e5c0');
+const CS_AFTER_SUB16190   = ptr('0x4e5e8');
+const CS_POISON_PATH      = ptr('0x4e5f0');
+const CS_AFTER_SUB15DD4   = ptr('0x4e638');
+const CS_AFTER_SUB59F40   = ptr('0x4e76c');
+const CS_AFTER_SUB36764   = ptr('0x4e78c');
+const CS_AFTER_SUB5E684   = ptr('0x4e7a8');
+
+// Return addresses inside sub_5E684 after each BL.
+const RA_AFTER_OPEN_ICDAT = ptr('0x5e6bc');
+const RA_AFTER_DECRYPT   = ptr('0x5e7f0');
+const RA_AFTER_DECOMP    = ptr('0x5e860');
+
+// CRC/integrity tracing sites.
+const H_SUB_5F0D0_RVA = ptr('0x5f0d0'); // build native lib CRC watchlist
+const H_SUB_5F46C_RVA = ptr('0x5f46c'); // mmap file and compute CRC32
+const CS_5E684_ICDAT_CRC_STORE = ptr('0x5f0b8'); // STR W28, [X21,X8,LSL#2]
+const CS_5E684_SIPHASH_COMPARE = ptr('0x5ee54'); // CMP expected, computed
+const CS_5F0D0_MAP_PATH_STRLEN = ptr('0x5f130'); // strlen(mapped outer-lib path)
+const CS_5F0D0_AFTER_PATH_STRLEN = ptr('0x5f134');
+const CS_5F0D0_AFTER_APK_K_CMP = ptr('0x5f17c');
+const CS_5F0D0_SUCCESS_RET0 = ptr('0x5f35c');
+const CS_5F0D0_INIT_ZIP_ITER = ptr('0x5f1d0');
+const CS_5F0D0_NATIVE_CRC_READ = ptr('0x5f2dc'); // LDR W22, [central_dir_entry,#0x10]
+const CS_5F0D0_ERROR_731 = ptr('0x5f1d8'); // MOV W0, #0x2DB
+const CS_5F46C_COMPUTED_CRC = ptr('0x5f548'); // after sub_771EC, before compare expected CRC
+
+const DUMP_DIR = '/data/data/com.dexprotector.detector.envchecks/files/ic_dat_dumps';
+const BYPASS_PRE_ICDAT_CHECKS = true; // needed because Frida can trip anti-instrumentation checks before sub_5E684.
+const FORCE_CLEAN_SUB3E038_DIGEST = true;
+const BYPASS_SUB16190_COMPARE = false; // do not hook mid-block 0x4e5e8; fragile on this custom image.
+const BYPASS_SUB16190_FUNC = true;     // hook sub_16190 function after sub_3E038 and spoof only protected-code hash.
+const CLEAN_SUB3E038_HASH_LEN = 0x7caa0;
+// Fallback only. Preferred value is computed at runtime before installing hidden hooks.
+const CLEAN_SUB3E038_DIGEST_HEX = '949589497da12b8da29b5dcb375c1bee1045fcf8c474cadb9404d21e8259d078';
+
+const hooked = new Set();
+const installedOuterBases = new Set();
+const installedHiddenBases = new Set();
+const blockedWatchdogThreadStarts = {};
+let pthreadCreateBlockerInstalled = false;
+let pthreadDetachZeroBlockerInstalled = false;
+let hiddenBase = null;
+let pendingHiddenLoadBias = null;
+let runtimeCleanSub3E038DigestBytes = null;
+let runtimeCleanSub16190Hash = null;
+let sub16190FuncHookInstalled = false;
+let outerHiddenReturnAddress = null;
+let seq = 0;
+
+function log(s) { console.log(s); }
+function warn(s) { console.warn(s); }
+
+function hexBytes(bytes) {
+  if (bytes === null) return '<read failed>';
+  return bytes.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
+
+function bytesEq(a, b) {
+  if (a === null || b === null || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if ((a[i] & 0xff) !== (b[i] & 0xff)) return false;
+  }
+  return true;
+}
+
+function hexToBytes(s) {
+  const clean = s.replace(/[^0-9a-fA-F]/g, '');
+  if ((clean.length & 1) !== 0) throw new Error(`odd hex length: ${clean.length}`);
+  const out = [];
+  for (let i = 0; i < clean.length; i += 2) out.push(parseInt(clean.slice(i, i + 2), 16));
+  return out;
+}
+
+function readBytes(p, len) {
+  try {
+    if (!p || p.isNull() || len <= 0) return null;
+    const ab = p.readByteArray(len);
+    if (ab === null) return null;
+    return Array.from(new Uint8Array(ab));
+  } catch (_) { return null; }
+}
+
+function readU32Safe(p) {
+  try { return p.readU32() >>> 0; } catch (_) { return null; }
+}
+
+function fmtU32(v) {
+  if (v === null || v === undefined) return '<err>';
+  return '0x' + (v >>> 0).toString(16).padStart(8, '0');
+}
+
+function bytesToAscii(bs) {
+  if (bs === null) return '<read failed>';
+  let s = '';
+  for (let i = 0; i < bs.length; i++) {
+    const c = bs[i] & 0xff;
+    s += (c >= 0x20 && c < 0x7f) ? String.fromCharCode(c) : '.';
+  }
+  return s;
+}
+
+function readAsciiLen(p, len) {
+  if (!p || p.isNull() || len <= 0) return '';
+  return bytesToAscii(readBytes(p, Math.min(len, 4096)));
+}
+
+function readZipEntryName(entry) {
+  try {
+    if (!entry || entry.isNull()) return '<null-entry>';
+    const nameLen = entry.add(0x1c).readU16();
+    return readAsciiLen(entry.add(0x2e), nameLen);
+  } catch (_) { return '<bad-entry>'; }
+}
+
+function readZipEntryCrc(entry) {
+  try { return entry.add(0x10).readU32() >>> 0; } catch (_) { return null; }
+}
+
+function readZipEntrySize(entry) {
+  try { return entry.add(0x18).readU32() >>> 0; } catch (_) { return null; }
+}
+
+function writeBytes(p, bytes) {
+  const u8 = new Uint8Array(bytes);
+  p.writeByteArray(u8.buffer);
+}
+
+function tryWriteBytes(p, bytes) {
+  try { writeBytes(p, bytes); return true; } catch (_) { return false; }
+}
+
+function readU64Ptr(addr) {
+  try { return addr.readPointer(); } catch (_) { return null; }
+}
+
+function keyWithFixedRBrkXor(rawKey) {
+  if (rawKey === null) return null;
+  const out = rawKey.slice();
+  out[0]  ^= SPOOF_RBRK_BYTES[0];
+  out[4]  ^= SPOOF_RBRK_BYTES[1];
+  out[8]  ^= SPOOF_RBRK_BYTES[2];
+  out[12] ^= SPOOF_RBRK_BYTES[3];
+  return out;
+}
+
+function safeCString(p) {
+  try { if (!p || p.isNull()) return null; return p.readCString(); } catch (_) { return null; }
+}
+
+function findExport(name) {
+  if (typeof Module.findExportByName === 'function') return Module.findExportByName(null, name);
+  if (typeof Module.getGlobalExportByName === 'function') {
+    try { return Module.getGlobalExportByName(name); } catch (_) { return null; }
+  }
+  return null;
+}
+
+function installWatchdogThreadBlocker(loadBias) {
+  const starts = [
+    [loadBias.add(H_THREAD_5CB5C_RVA), 'sub_5CB5C spawned by sub_5CB1C'],
+    [loadBias.add(H_THREAD_5D730_RVA), 'sub_5D730 spawned by sub_5D6F0'],
+  ];
+
+  starts.forEach(([addr, label]) => {
+    blockedWatchdogThreadStarts[addr.toString()] = label;
+  });
+
+  // Block only these two protector watchdog start_routines. Other app/system threads still go through.
+  if (!pthreadCreateBlockerInstalled) {
+    const pCreate = findExport('pthread_create');
+    if (pCreate === null) {
+      warn('[watchdog BLOCK] pthread_create export not found; watchdog threads may still spawn');
+    } else {
+      const realPthreadCreate = new NativeFunction(pCreate, 'int', ['pointer', 'pointer', 'pointer', 'pointer']);
+      Interceptor.replace(pCreate, new NativeCallback(function (threadPtr, attr, startRoutine, arg) {
+        const label = blockedWatchdogThreadStarts[startRoutine.toString()];
+        if (label !== undefined) {
+          try {
+            // Caller will still call pthread_detach(tid). Give it fake tid=0 and make detach(0) harmless below.
+            if (!threadPtr.isNull()) threadPtr.writePointer(ptr(0));
+          } catch (_) {}
+          log(`[watchdog BLOCK] pthread_create start=${moduleDesc(startRoutine)} ${label} arg=${arg} -> 0 (not spawned)`);
+          return 0;
+        }
+        return realPthreadCreate(threadPtr, attr, startRoutine, arg);
+      }, 'int', ['pointer', 'pointer', 'pointer', 'pointer']));
+      pthreadCreateBlockerInstalled = true;
+      log(`[hooked] pthread_create selective watchdog blocker @ ${pCreate}`);
+    }
+  }
+
+  // Safety: sub_5CB1C/sub_5D6F0 call pthread_detach(tid) after pthread_create success.
+  // If tid is our fake 0, swallow it. Real detach calls still go through.
+  if (!pthreadDetachZeroBlockerInstalled) {
+    const pDetach = findExport('pthread_detach');
+    if (pDetach === null) {
+      warn('[watchdog BLOCK] pthread_detach export not found; fake tid=0 detach will use real libc');
+    } else {
+      const realPthreadDetach = new NativeFunction(pDetach, 'int', ['pointer']);
+      Interceptor.replace(pDetach, new NativeCallback(function (tid) {
+        if (tid.isNull()) {
+          log('[watchdog BLOCK] pthread_detach fake tid=0 -> 0');
+          return 0;
+        }
+        return realPthreadDetach(tid);
+      }, 'int', ['pointer']));
+      pthreadDetachZeroBlockerInstalled = true;
+      log(`[hooked] pthread_detach fake-zero blocker @ ${pDetach}`);
+    }
+  }
+}
+
+function mkdirOne(path) {
+  try {
+    const p = findExport('mkdir');
+    if (p === null) return false;
+    const mkdir = new NativeFunction(p, 'int', ['pointer', 'int']);
+    mkdir(Memory.allocUtf8String(path), 0x1c0); // 0700
+    return true;
+  } catch (_) { return false; }
+}
+
+function dumpMemoryToFile(name, addr, len) {
+  mkdirOne(DUMP_DIR);
+  const path = `${DUMP_DIR}/${name}`;
+  const ab = addr.readByteArray(len);
+  if (ab === null) throw new Error(`readByteArray null @ ${addr} len=0x${len.toString(16)}`);
+  const f = new File(path, 'wb');
+  try { f.write(ab); f.flush(); }
+  finally { f.close(); }
+  log(`[dump] ${name} addr=${addr} len=0x${len.toString(16)} -> ${path}`);
+}
+
+function dumpPreview(tag, addr, len) {
+  const n = Math.min(len, 0x80);
+  const b = readBytes(addr, n);
+  log(`[${tag}] first_${n}=${hexBytes(b)}`);
+}
+
+function attachOnce(addr, label, handlers) {
+  const k = `${label}@${addr}`;
+  if (hooked.has(k)) return;
+  try {
+    Interceptor.attach(addr, handlers);
+    hooked.add(k);
+    log(`[hooked] ${label} @ ${addr}`);
+  } catch (e) {
+    warn(`[hook FAIL] ${label} @ ${addr}: ${e}`);
+  }
+}
+
+function replaceOnce(addr, label, callback) {
+  const k = `replace:${label}@${addr}`;
+  if (hooked.has(k)) return;
+  try {
+    Interceptor.replace(addr, callback);
+    hooked.add(k);
+    log(`[replaced] ${label} @ ${addr}`);
+  } catch (e) {
+    warn(`[replace FAIL] ${label} @ ${addr}: ${e}`);
+  }
+}
+
+function moduleDesc(p) {
+  try {
+    const m = Process.findModuleByAddress(p);
+    if (m !== null) return `${m.name}+0x${p.sub(m.base).toString(16)}`;
+  } catch (_) {}
+  if (hiddenBase !== null) {
+    try {
+      const off = p.sub(hiddenBase);
+      if (off.compare(ptr(0)) >= 0 && off.compare(ptr('0x1000000')) < 0) return `hidden+0x${off.toString(16)}`;
+    } catch (_) {}
+  }
+  return String(p);
+}
+
+function ptrEq(a, b) {
+  try { return a.compare(b) === 0; } catch (_) { return false; }
+}
+
+function u64ToSafeNumber(v) {
+  try {
+    const n = v.toNumber();
+    if (Number.isSafeInteger(n)) return n;
+  } catch (_) {}
+  try { return v.toUInt32(); } catch (_) {}
+  return -1;
+}
+
+function findLinkerModule() {
+  const want = Process.pointerSize === 8 ? 'linker64' : 'linker';
+  const mods = Process.enumerateModules();
+  return mods.find(m => m.name === want) ||
+         mods.find(m => /\/(linker64|linker)$/.test(m.path)) ||
+         mods.find(m => m.name.indexOf('linker') !== -1 || m.path.indexOf('/linker') !== -1);
+}
+
+function enumSymbols(m) {
+  if (m && typeof m.enumerateSymbols === 'function') return m.enumerateSymbols();
+  if (typeof Module.enumerateSymbolsSync === 'function') return Module.enumerateSymbolsSync(m.name);
+  if (typeof Module.enumerateSymbols === 'function') return Module.enumerateSymbols(m.name);
+  throw new Error('No symbol enumeration API available');
+}
+
+function isTargetPath(s) {
+  return s !== null && s.indexOf(TARGET_LIB) !== -1;
+}
+
+function findTargetModule(path) {
+  let m = Process.findModuleByName(TARGET_LIB);
+  if (m !== null) return m;
+  return Process.enumerateModules().find(x => x.path === path || x.path.indexOf(TARGET_LIB) !== -1 || x.name === TARGET_LIB) || null;
+}
+
+function computeRuntimeCleanSub3E038Digest(loadBias) {
+  if (!FORCE_CLEAN_SUB3E038_DIGEST) return null;
+  if (runtimeCleanSub3E038DigestBytes !== null) return runtimeCleanSub3E038DigestBytes;
+
+  try {
+    // Important: called from outer sub_167C onLeave, before any hidden-code Interceptor.attach().
+    // Read/execute clean hidden code, no inline patch inside hidden image yet.
+    const out = Memory.alloc(32);
+    const hashFn = new NativeFunction(
+      loadBias.add(H_SUB_320B4_RVA),
+      'int',
+      ['pointer', 'ulong', 'pointer', 'pointer']
+    );
+    const ret = hashFn(loadBias, CLEAN_SUB3E038_HASH_LEN, out, ptr(0));
+    const digest = readBytes(out, 32);
+    if (digest !== null) {
+      runtimeCleanSub3E038DigestBytes = digest;
+      log(`[runtime clean sub_3E038 digest] ret=${ret} data=${loadBias} len=0x${CLEAN_SUB3E038_HASH_LEN.toString(16)} digest=${hexBytes(digest)}`);
+    } else {
+      warn('[runtime clean sub_3E038 digest] read digest failed; fallback static digest will be used');
+    }
+  } catch (e) {
+    warn(`[runtime clean sub_3E038 digest] compute failed: ${e}; fallback static digest will be used`);
+  }
+
+  return runtimeCleanSub3E038DigestBytes;
+}
+
+function computeRuntimeCleanSub16190Hash(loadBias) {
+  if (!BYPASS_SUB16190_FUNC) return null;
+  if (runtimeCleanSub16190Hash !== null) return runtimeCleanSub16190Hash;
+
+  try {
+    // Clean point: outer JNI_OnLoad before hidden sub_4E354 runs, before hidden hooks.
+    const key = Memory.alloc(16);
+    key.writeByteArray(new Uint8Array(16).buffer);
+
+    const start = loadBias.add(H_PROTECTED_CODE_START_RVA);
+    const len = H_PROTECTED_CODE_END_RVA.sub(H_PROTECTED_CODE_START_RVA).toUInt32();
+    const siphash = new NativeFunction(
+      loadBias.add(H_SUB_16190_RVA),
+      'pointer',
+      ['pointer', 'ulong', 'pointer']
+    );
+
+    runtimeCleanSub16190Hash = siphash(start, len, key);
+    log(`[runtime clean sub_16190] data=${start} len=0x${len.toString(16)} key=zero16 hash=${runtimeCleanSub16190Hash}`);
+  } catch (e) {
+    warn(`[runtime clean sub_16190] compute failed: ${e}; will use qword_8CEF8 if available`);
+  }
+
+  return runtimeCleanSub16190Hash;
+}
+
+function installSub16190FunctionSpoof(loadBias, onSpoof) {
+  if (!BYPASS_SUB16190_FUNC) return;
+  if (sub16190FuncHookInstalled) return;
+
+  const expected = runtimeCleanSub16190Hash || readU64Ptr(loadBias.add(H_QWORD_8CEF8_RVA));
+  if (expected === null) {
+    warn('[sub_16190 func spoof] no expected hash available');
+    return;
+  }
+
+  const targetData = loadBias.add(H_PROTECTED_CODE_START_RVA);
+  const targetLen = H_PROTECTED_CODE_END_RVA.sub(H_PROTECTED_CODE_START_RVA).toUInt32();
+  const addr = loadBias.add(H_SUB_16190_RVA);
+
+  Interceptor.attach(addr, {
+    onEnter(args) {
+      this.data = args[0];
+      this.len = u64ToSafeNumber(args[1]);
+      this.key = args[2];
+      this.match = ptrEq(this.data, targetData) && this.len === targetLen;
+      if (this.match) {
+        log(`[sub_16190 enter protected] data=${this.data} len=0x${this.len.toString(16)} key=${this.key} expected=${expected}`);
+      }
+    },
+    onLeave(retval) {
+      if (!this.match) return;
+      const real = ptr(retval);
+      retval.replace(expected);
+      log(`[sub_16190 spoof protected] real=${real} -> ${expected}`);
+      if (typeof onSpoof === 'function') {
+        try { onSpoof(); } catch (e) { warn(`[sub_16190 spoof protected] onSpoof failed: ${e}`); }
+      }
+    }
+  });
+
+  sub16190FuncHookInstalled = true;
+  log(`[hooked] sub_16190 function spoof @ ${addr} protected=${targetData}+0x${targetLen.toString(16)} expected=${expected}`);
+}
+
+function installCleanSub3E038DigestHook(loadBias) {
+  if (!FORCE_CLEAN_SUB3E038_DIGEST) return;
+
+  const digestBytes = runtimeCleanSub3E038DigestBytes || hexToBytes(CLEAN_SUB3E038_DIGEST_HEX);
+  const digestSource = runtimeCleanSub3E038DigestBytes !== null ? 'runtime-clean' : 'static-fallback';
+  const digestHex = hexBytes(digestBytes);
+  const sub320b4 = loadBias.add(H_SUB_320B4_RVA);
+  let hook = null;
+  let forced = false;
+
+  hook = Interceptor.attach(sub320b4, {
+    onEnter(args) {
+      this.data = args[0];
+      this.len = u64ToSafeNumber(args[1]);
+      this.out = args[2];
+      this.flag = args[3];
+
+      // sub_3E038 hashes the hidden image header/range:
+      //   sub_320B4(hidden_base, 0x7caa0, digest32, 0)
+      // Only force this exact call, not every hash call in the protector.
+      this.isSub3E038HiddenHash =
+        !forced &&
+        this.len === CLEAN_SUB3E038_HASH_LEN &&
+        ptrEq(this.data, loadBias);
+
+      if (this.isSub3E038HiddenHash) {
+        log(`[sub_320B4/sub_3E038 enter] data=${this.data} len=0x${this.len.toString(16)} out=${this.out} flag=${this.flag} caller=${moduleDesc(this.context.lr)}`);
+      }
+    },
+    onLeave(retval) {
+      if (!this.isSub3E038HiddenHash) return;
+
+      const realDigest = readBytes(this.out, 32);
+      const ok = tryWriteBytes(this.out, digestBytes);
+      const forcedDigest = readBytes(this.out, 32);
+      forced = true;
+
+      log(`[sub_320B4/sub_3E038 force digest] real=${hexBytes(realDigest)} clean=${digestHex} source=${digestSource} ok=${ok} after=${hexBytes(forcedDigest)} ret=${retval}`);
+
+      // One-shot: once sub_3E038 got the clean digest, remove this inline hook.
+      // This reduces later integrity noise from this hook itself.
+      try {
+        hook.detach();
+        log('[sub_320B4/sub_3E038 force digest] detached one-shot hook');
+      } catch (e) {
+        warn(`[sub_320B4/sub_3E038 force digest] detach failed: ${e}`);
+      }
+    }
+  });
+
+  log(`[hooked] one-shot clean sub_3E038 digest via sub_320B4 @ ${sub320b4} digest=${digestHex} source=${digestSource}`);
+}
+
+
+function installCrcTraceHooks(loadBias) {
+  // Our Interceptor on hidden sub_4E354 entry may perturb LR, and sub_4E354 saves LR into qword_8CEF0.
+  // sub_5F0D0 later calls sub_4E348()->qword_8CEF0 and uses /proc/self/maps to recover the outer
+  // libdexprotector.so path. If qword_8CEF0 points to a Frida/anonymous trampoline, that path becomes
+  // empty and sub_5F0D0 returns 731 before CRC checks. Restore the original outer return address.
+  attachOnce(loadBias.add(CS_AFTER_STORE_QWORD_8CEF0), 'restore qword_8CEF0 outer return address', {
+    onEnter() {
+      if (outerHiddenReturnAddress === null) return;
+      const slot = loadBias.add(H_QWORD_8CEF0_RVA);
+      let before = null;
+      try { before = slot.readPointer(); slot.writePointer(outerHiddenReturnAddress); } catch (e) { warn(`[qword_8CEF0 fix] failed: ${e}`); return; }
+      log(`[qword_8CEF0 fix] before=${before} forced=${outerHiddenReturnAddress}`);
+    }
+  });
+
+  const sub5f0d0 = loadBias.add(H_SUB_5F0D0_RVA);
+  const sub5f46c = loadBias.add(H_SUB_5F46C_RVA);
+  const pathState = {};
+
+  attachOnce(sub5f0d0, 'sub_5F0D0 native-lib CRC watchlist', {
+    onEnter(args) {
+      this.id = ++seq;
+      this.zipInfo = args[0];
+      log(`\n[sub_5F0D0 enter #${this.id}] apk_zip_info=${this.zipInfo} caller=${moduleDesc(this.context.lr)}`);
+    },
+    onLeave(retval) {
+      log(`[sub_5F0D0 leave #${this.id}] ret=${retval} (${retval.toInt32 ? retval.toInt32() : retval})`);
+    }
+  });
+
+  // Path found by sub_3C0EC(qword_8CEF0, ..., &path): mapping path containing outer libdexprotector.so.
+  attachOnce(loadBias.add(CS_5F0D0_MAP_PATH_STRLEN), 'sub_5F0D0 mapped path before strlen', {
+    onEnter() {
+      const path = safeCString(this.context.x0);
+      pathState[this.threadId] = { ptr: this.context.x0, path };
+      log(`[sub_5F0D0 path] ${JSON.stringify(path)}`);
+    }
+  });
+
+  attachOnce(loadBias.add(CS_5F0D0_AFTER_PATH_STRLEN), 'sub_5F0D0 after strlen(path)', {
+    onEnter() {
+      const st = pathState[this.threadId] || {};
+      const len = this.context.x0.toUInt32();
+      let last4 = '';
+      try { if (st.ptr && len >= 4) last4 = readAsciiLen(st.ptr.add(len - 4), 4); } catch (_) {}
+      log(`[sub_5F0D0 strlen] len=${len} last4=${JSON.stringify(last4)} path=${JSON.stringify(st.path)}`);
+    }
+  });
+
+  attachOnce(loadBias.add(CS_5F0D0_AFTER_APK_K_CMP), 'sub_5F0D0 after .apk final cmp', {
+    onEnter() {
+      log(`[sub_5F0D0 .apk check] last_char_w8=0x${(this.context.x8.toUInt32() & 0xff).toString(16)} expect=0x6b`);
+    }
+  });
+
+  attachOnce(loadBias.add(CS_5F0D0_SUCCESS_RET0), 'sub_5F0D0 success ret0', {
+    onEnter() {
+      log('[sub_5F0D0 SUCCESS] returning 0');
+    }
+  });
+
+  attachOnce(loadBias.add(CS_5F0D0_INIT_ZIP_ITER), 'sub_5F0D0 init ZIP iterator', {
+    onEnter() {
+      log(`[sub_5F0D0 zip-iter] calling sub_3C940 apk_zip_info=${this.context.x0} iter=${this.context.x1}`);
+    }
+  });
+
+  // Common 731 return in sub_5F0D0. LR tells which path reached the error block less reliably than PC,
+  // but logging PC hit helps see whether failure happens before native-lib CRC thread is built.
+  attachOnce(loadBias.add(CS_5F0D0_ERROR_731), 'sub_5F0D0 hit error 731', {
+    onEnter() {
+      log(`[sub_5F0D0 ERROR] hit loc_5F1D8 -> return 731; lr=${moduleDesc(this.context.lr)}`);
+    }
+  });
+
+  // sub_5F0D0 reads native lib CRC32 directly from APK ZIP central directory.
+  attachOnce(loadBias.add(CS_5F0D0_NATIVE_CRC_READ), 'sub_5F0D0 native CRC from APK central-dir', {
+    onEnter() {
+      const ent = this.context.x21; // central directory entry pointer
+      const name = readZipEntryName(ent);
+      const crc = readZipEntryCrc(ent);
+      const size = readZipEntrySize(ent);
+      log(`[native central-dir CRC] name=${JSON.stringify(name)} crc=${fmtU32(crc)} size=0x${(size === null ? 0 : size).toString(16)} entry=${ent}`);
+    }
+  });
+
+  // sub_5E684 stores CRC32 values for ic.dat-listed APK entries into crc_array[index].
+  attachOnce(loadBias.add(CS_5E684_ICDAT_CRC_STORE), 'sub_5E684 ic.dat listed CRC store', {
+    onEnter() {
+      const idx = this.context.x8.toUInt32();
+      const crc = this.context.x28.toUInt32();
+      const crcArray = this.context.x21;
+      const centralName = readAsciiLen(this.context.x23, this.context.x22.toUInt32());
+      let icName = '<unknown>';
+      try {
+        const rec = this.context.x20;
+        const p = rec.add(0x38).readPointer(); // name pointer stored in hash record
+        icName = safeCString(p) || '<non-cstr>';
+      } catch (_) {}
+      log(`[ic.dat CRC store] index=${idx} crc=${fmtU32(crc)} central=${JSON.stringify(centralName)} ic_name=${JSON.stringify(icName)} dst=${crcArray.add(idx * 4)}`);
+    }
+  });
+
+  // Final SipHash over collected CRC32 array compared with expected hash from ic.dat header.
+  attachOnce(loadBias.add(CS_5E684_SIPHASH_COMPARE), 'sub_5E684 CRC-array SipHash compare', {
+    onEnter() {
+      log(`[ic.dat CRC SipHash] expected=${this.context.x8} computed=${this.context.x0} match=${ptrEq(this.context.x8, this.context.x0)}`);
+    }
+  });
+
+  // sub_5F46C opens a real native-lib path, mmaps it, computes CRC32 via sub_771EC, compares with central-dir CRC.
+  attachOnce(sub5f46c, 'sub_5F46C compute actual native CRC32', {
+    onEnter(args) {
+      this.id = ++seq;
+      this.rec = args[0];
+      let path = '<bad-record>';
+      let expected = null;
+      let size = null;
+      try {
+        path = safeCString(this.rec.readPointer()) || '<null-path>';
+        expected = this.rec.add(8).readU32() >>> 0;
+        size = this.rec.add(0x10).readU64();
+      } catch (_) {}
+      this.path = path;
+      this.expected = expected;
+      log(`\n[sub_5F46C enter #${this.id}] path=${JSON.stringify(path)} expected_crc=${fmtU32(expected)} expected_size=${size} caller=${moduleDesc(this.context.lr)}`);
+    },
+    onLeave(retval) {
+      log(`[sub_5F46C leave #${this.id}] ret=${retval} (${retval.toInt32 ? retval.toInt32() : retval}) path=${JSON.stringify(this.path)}`);
+    }
+  });
+
+  attachOnce(loadBias.add(CS_5F46C_COMPUTED_CRC), 'sub_5F46C computed CRC32 compare', {
+    onEnter() {
+      const rec = this.context.x19;
+      let path = '<bad-record>';
+      let expected = null;
+      try {
+        path = safeCString(rec.readPointer()) || '<null-path>';
+        expected = rec.add(8).readU32() >>> 0;
+      } catch (_) {}
+      const computed = this.context.x9.toUInt32();
+      log(`[native computed CRC] path=${JSON.stringify(path)} expected=${fmtU32(expected)} computed=${fmtU32(computed)} match=${expected !== null && ((expected >>> 0) === (computed >>> 0))}`);
+    }
+  });
+}
+
+function installHiddenHooks(loadBias) {
+  const key = loadBias.toString();
+  if (installedHiddenBases.has(key)) return;
+  installedHiddenBases.add(key);
+  hiddenBase = loadBias;
+  mkdirOne(DUMP_DIR);
+
+  const sub4e354 = loadBias.add(H_SUB_4E354_RVA);
+  const sub4e7d8 = loadBias.add(H_SUB_4E7D8_RVA);
+  const sub5e684 = loadBias.add(H_SUB_5E684_RVA);
+  const sub54944 = loadBias.add(H_SUB_54944_RVA);
+  const sub20754 = loadBias.add(H_SUB_20754_RVA);
+  const sub71844 = loadBias.add(H_SUB_71844_RVA);
+  const expectedHashAddr = loadBias.add(H_QWORD_8CEF8_RVA);
+
+  log(`[hidden] load_bias=${loadBias}`);
+  log(`[bypass] qword_8CEF8 @ ${expectedHashAddr} = ${readU64Ptr(expectedHashAddr)}`);
+  installWatchdogThreadBlocker(loadBias);
+  installCleanSub3E038DigestHook(loadBias);
+  installSub16190FunctionSpoof(loadBias);
+  installCrcTraceHooks(loadBias);
+
+  attachOnce(sub4e354, 'sub_4E354 hidden native entry', {
+    onEnter(args) {
+      this.id = ++seq;
+      log(`\n[sub_4E354/ProtectedApplication.ye enter #${this.id}] x0=${args[0]} caller=${moduleDesc(this.context.lr)}`);
+    },
+    onLeave(retval) {
+      log(`[sub_4E354/ProtectedApplication.ye leave #${this.id}] ret=${retval}`);
+    }
+  });
+
+  attachOnce(sub4e7d8, 'sub_4E7D8 MessageGuardException path', {
+    onEnter(args) {
+      let code = -1;
+      try { code = args[1].toInt32(); } catch (_) {}
+      log(`\n[ERROR sub_4E7D8] MessageGuardException path code=${code} raw=${args[1]} caller=${moduleDesc(this.context.lr)}`);
+    }
+  });
+
+  // IMPORTANT:
+  // sub_3E038 derives the later ic.dat key by scanning 16K pages from around 0x3e064 downward.
+  // If we hook low helper functions early (sub_16190 @0x16190, sub_15DD4 @0x15DD4,
+  // sub_20754 @0x20754, sub_363F0/3601C/3662C...), Frida patches those pages and the key becomes wrong.
+  // So: hook safe call-sites in sub_4E354 page instead, and delay low-page hooks until after sub_3E038.
+
+  function hookCallsiteForceZero(rva, name, alsoZeroX20) {
+    attachOnce(loadBias.add(rva), `callsite ${name} -> zero`, {
+      onEnter() {
+        const beforeX0 = this.context.x0;
+        const beforeW20 = this.context.x20;
+        if (beforeX0.toInt32() !== 0 || (alsoZeroX20 && beforeW20.toInt32() !== 0)) {
+          log(`[callsite BYPASS] ${name} before x0=${beforeX0} x20=${beforeW20} caller=${moduleDesc(this.context.lr)}`);
+        }
+        this.context.x0 = ptr(0);
+        if (alsoZeroX20) this.context.x20 = ptr(0);
+      }
+    });
+  }
+
+  // Low-page checks are bypassed from their return sites, not by hooking the low helper functions.
+  hookCallsiteForceZero(CS_AFTER_SUB3B6D8, 'after sub_3B6D8', false);
+  hookCallsiteForceZero(CS_AFTER_SUB363F0, 'after sub_363F0/sdk_check', false);
+  hookCallsiteForceZero(CS_AFTER_SUB5CB1C, 'after sub_5CB1C/watchdog_spawn_1', false);
+  hookCallsiteForceZero(CS_AFTER_SUB5D6F0, 'after sub_5D6F0/watchdog_spawn_2', true);
+  hookCallsiteForceZero(CS_AFTER_SUB3601C, 'after sub_3601C', false);
+  hookCallsiteForceZero(CS_AFTER_SUB3662C, 'after sub_3662C', false);
+  hookCallsiteForceZero(CS_AFTER_SUB36764, 'after sub_36764', false);
+
+  // Above-scan-range checks are safe to hook/replace directly.
+  const preChecks = [
+    ['sub_5E38C', 0x5e38c, 'log'],
+    ['sub_63EA8_fake_eventlog', 0x63ea8, 'log'],
+
+    // Letting sub_5C4A4 run detects Frida in maps and can report poison. It is above the self-key scan
+    // range, so replacing it does not disturb sub_3E038.
+    ['sub_5C4A4_maps_libc_art_check', 0x5c4a4, 'replace'],
+
+    ['sub_59F40_apk_asset_consistency', 0x59f40, 'log'],
+  ];
+
+  preChecks.forEach(([name, off, mode]) => {
+    const addr = loadBias.add(ptr(off));
+    if (mode === 'replace' && BYPASS_PRE_ICDAT_CHECKS) {
+      let n = 0;
+      replaceOnce(addr, `precheck ${name} -> 0`, new NativeCallback(function () {
+        n++;
+        // Normal successful sub_5C4A4 ends by clearing byte_8A0D4. Keep that side effect.
+        try { loadBias.add(ptr('0x8a0d4')).writeU8(0); } catch (_) {}
+        log(`[precheck SKIP] ${name} call#${n} ret -> 0; byte_8A0D4=0`);
+        return 0;
+      }, 'int', []));
+      return;
+    }
+
+    attachOnce(addr, `precheck ${name}`, {
+      onEnter() { this.lr = this.context.lr; },
+      onLeave(retval) {
+        const code = retval.toInt32();
+        if (code !== 0) {
+          log(`[precheck FAIL] ${name} ret=${code} raw=${retval} caller=${moduleDesc(this.lr)}`);
+          if (BYPASS_PRE_ICDAT_CHECKS) {
+            retval.replace(0);
+            log(`[precheck BYPASS] ${name} ret -> 0`);
+          }
+        }
+      }
+    });
+  });
+
+  if (BYPASS_SUB16190_COMPARE) {
+    // Code integrity compare site after BL sub_16190.
+    attachOnce(loadBias.add(CS_AFTER_SUB16190), 'callsite after sub_16190 compare spoof', {
+      onEnter() {
+        const expected = this.context.x20;
+        const real = this.context.x0;
+        const ctx = this.context.sp.add(0x20);
+        log(`[callsite sub_16190] real=${real} expected(x20)=${expected} ctx64=${hexBytes(readBytes(ctx, 64))}; installing delayed ic.dat hook`);
+        this.context.x0 = expected; // CMP X20, X0 will pass.
+        installDelayedIcDecryptHook();
+      }
+    });
+
+    // Belt-and-suspenders: if branch still reaches the tamper/poison path, jump over sub_15E24.
+    attachOnce(loadBias.add(CS_POISON_PATH), 'callsite poison path guard', {
+      onEnter() {
+        log('[POISON PATH HIT] skipping sub_15E24 tamper update -> loc_4E608');
+        this.context.pc = loadBias.add(ptr('0x4e608'));
+      }
+    });
+  } else {
+    log('[option3] sub_16190 compare bypass disabled; poison guard disabled');
+  }
+
+  // Magic compare site after BL sub_15DD4. Do not hook sub_15DD4 itself before sub_3E038.
+  // Only log the real output here; do not spoof. This tells us whether current v54 is already correct.
+  attachOnce(loadBias.add(CS_AFTER_SUB15DD4), 'callsite after sub_15DD4 log actual output', {
+    onEnter() {
+      const out = this.context.sp.add(0x14); // var_9C in sub_4E354 frame
+      const keyCtx = this.context.sp.add(0x20); // var_90/v54 in sub_4E354 frame
+      const input = this.context.sp.add(0x18);  // var_98 = 0x91A4FB076B659459
+      const actual = readBytes(out, 4);         // real sub_15DD4 output before our spoof
+      const v54 = readBytes(keyCtx, 32);
+      const input8 = readBytes(input, 8);
+      const expected = readBytes(loadBias.add(ptr('0x8976c')), 4) || EXPECTED_MAGIC_4E354;
+      const actualMatchesExpected = bytesEq(actual, expected);
+
+      log(`[sub_15DD4 actual] v54=${hexBytes(v54)} input=${hexBytes(input8)} out=${hexBytes(actual)} expected=${hexBytes(expected)} v54_ok=${actualMatchesExpected}`);
+      installDelayedIcDecryptHook();
+    }
+  });
+
+  // Install only after sub_16190 has already computed code hash. sub_20754 lives inside 0x10e00..0x771e8,
+  // so installing it before sub_16190 can change the hash input.
+  let delayedIcDecryptHookInstalled = false;
+  function installDelayedIcDecryptHook() {
+    if (delayedIcDecryptHookInstalled) return;
+    delayedIcDecryptHookInstalled = true;
+    attachOnce(sub20754, 'sub_20754 decrypt ic.dat DELAYED', {
+      onEnter(args) {
+        this.fromIc = ptrEq(this.context.lr, loadBias.add(RA_AFTER_DECRYPT));
+        if (!this.fromIc) return;
+        this.len = args[1].toUInt32();        // ciphertext len = asset_size - 16
+        this.nonce = args[2];
+        this.tag = args[5];
+        this.input = args[6];
+        this.out = args[7];
+        log(`[ic.dat decrypt enter] len=0x${this.len.toString(16)} in=${this.input} tag=${this.tag} nonce=${this.nonce} out=${this.out}`);
+      },
+      onLeave(retval) {
+        if (!this.fromIc) return;
+        const ret = retval.toInt32();
+        log(`[ic.dat decrypt leave] ret=${ret} out=${this.out} len=0x${this.len.toString(16)}`);
+        if (ret !== 0) return;
+        try {
+          const decompSize = this.out.readU32();
+          const compSize = this.len >= 4 ? this.len - 4 : 0;
+          log(`[ic.dat decrypted] decomp_size=0x${decompSize.toString(16)} comp_size=0x${compSize.toString(16)}`);
+          dumpPreview('ic.dat decrypted', this.out, this.len);
+          dumpMemoryToFile('ic_decrypted_with_size_and_compressed.bin', this.out, this.len);
+          if (compSize > 0) dumpMemoryToFile('ic_decrypted_compressed_payload.bin', this.out.add(4), compSize);
+        } catch (e) { warn(`[ic.dat decrypted] dump failed: ${e}`); }
+      }
+    });
+  }
+
+  // Do not hook CS_AFTER_SUB3E038. It sits right before sub_16190 setup; keeping it clean avoids
+  // relocation/trampoline weirdness and avoids touching low-page code before integrity hash.
+
+  attachOnce(sub5e684, 'sub_5E684 ic.dat integrity check', {
+    onEnter(args) {
+      this.id = ++seq;
+      this.ctx = args[0];
+      log(`\n[sub_5E684 enter #${this.id}] ctx=${this.ctx} caller=${moduleDesc(this.context.lr)}`);
+    },
+    onLeave(retval) {
+      log(`[sub_5E684 leave #${this.id}] ret=${retval} (${retval.toInt32 ? retval.toInt32() : retval})`);
+    }
+  });
+
+  // Optional raw encrypted asset dump: sub_54944(6, out3) from sub_5E684.
+  attachOnce(sub54944, 'sub_54944 open asset', {
+    onEnter(args) {
+      this.id = args[0].toInt32();
+      this.out = args[1];
+      this.fromIc = ptrEq(this.context.lr, loadBias.add(RA_AFTER_OPEN_ICDAT));
+    },
+    onLeave(retval) {
+      if (!this.fromIc || this.id !== 6) return;
+      const ret = retval.toInt32();
+      log(`[ic.dat raw open] ret=${ret} out=${this.out}`);
+      if (ret !== 0) return;
+      try {
+        const base = this.out.readPointer();
+        const sizePtr = this.out.add(Process.pointerSize).readPointer();
+        const size = sizePtr.toUInt32();
+        log(`[ic.dat raw] base=${base} size=0x${size.toString(16)} handle=${this.out.add(Process.pointerSize * 2).readPointer()}`);
+        dumpPreview('ic.dat raw', base, size);
+        dumpMemoryToFile('ic_raw_encrypted_asset.bin', base, size);
+      } catch (e) { warn(`[ic.dat raw] dump failed: ${e}`); }
+    }
+  });
+
+  // Dump fully decompressed ic.dat manifest.
+  attachOnce(sub71844, 'sub_71844 decompress ic.dat', {
+    onEnter(args) {
+      this.fromIc = ptrEq(this.context.lr, loadBias.add(RA_AFTER_DECOMP));
+      if (!this.fromIc) return;
+      this.out = args[0];
+      this.expected = args[1].toUInt32();
+      this.comp = args[2];
+      this.compLen = args[3].toUInt32();
+      log(`[ic.dat decompress enter] out=${this.out} expected=0x${this.expected.toString(16)} comp=${this.comp} comp_len=0x${this.compLen.toString(16)}`);
+    },
+    onLeave(retval) {
+      if (!this.fromIc) return;
+      const written = retval.toUInt32();
+      log(`[ic.dat decompress leave] written=0x${written.toString(16)} expected=0x${this.expected.toString(16)}`);
+      const len = Math.min(written, this.expected);
+      if (len <= 0) return;
+      try {
+        dumpPreview('ic.dat decompressed', this.out, len);
+        dumpMemoryToFile('ic_decompressed.bin', this.out, len);
+
+        if (len >= 0x24) {
+          const key0 = readBytes(this.out, 16);
+          const expectedHash = this.out.add(0x18).readU64();
+          const count = this.out.add(0x20).readU32();
+          log(`[ic.dat parsed] siphash_key16=${hexBytes(key0)} expected_hash=${expectedHash} entry_count=${count}`);
+          try {
+            const names = this.out.add(0x24).readCString(Math.min(len - 0x24, 4096));
+            log(`[ic.dat first names] ${JSON.stringify(names.slice(0, 300))}`);
+          } catch (_) {}
+        }
+      } catch (e) { warn(`[ic.dat decompressed] dump failed: ${e}`); }
+    }
+  });
+}
+
+function installOuterHooks(path) {
+  const m = findTargetModule(path);
+  if (m === null) {
+    warn(`[${TARGET_LIB}] module not visible yet path=${path}`);
+    return;
+  }
+  const key = m.base.toString();
+  if (installedOuterBases.has(key)) return;
+  installedOuterBases.add(key);
+
+  log(`[${TARGET_LIB}] base=${m.base} path=${m.path}`);
+  outerHiddenReturnAddress = m.base.add(DP_JNI_ONLOAD_RET_AFTER_HIDDEN_RVA);
+  log(`[outer] expected hidden return/qword_8CEF0=${outerHiddenReturnAddress}`);
+
+  const active918 = {};
+  attachOnce(m.base.add(DP_SUB_918_RVA), 'outer sub_918 entry/leave', {
+    onEnter(args) { active918[this.threadId] = { out: args[0], forcedKey: null }; },
+    onLeave(retval) {
+      const st = active918[this.threadId];
+      if (SPOOF_OUTER_KEY && st && st.forcedKey !== null) {
+        try { writeBytes(st.out, st.forcedKey); retval.replace(st.out); } catch (_) {}
+      }
+      delete active918[this.threadId];
+    }
+  });
+
+  attachOnce(m.base.add(DP_SUB_918_VM_RAW_COPIED_RVA), 'outer sub_918 raw key', {
+    onEnter() {
+      const out = this.context.x0;
+      const rawKey = readBytes(out, 32);
+      const forcedKey = keyWithFixedRBrkXor(rawKey);
+      if (active918[this.threadId] === undefined) active918[this.threadId] = { out, forcedKey: null };
+      active918[this.threadId].out = out;
+      active918[this.threadId].forcedKey = forcedKey;
+      if (SPOOF_OUTER_KEY && rawKey !== null && forcedKey !== null) {
+        log(`[outer sub_918] raw=${hexBytes(rawKey)} forced=${hexBytes(forcedKey)}`);
+      }
+    }
+  });
+
+  attachOnce(m.base.add(DP_SUB_918_FINAL_RVA), 'outer sub_918 final site', {
+    onEnter() {
+      const st = active918[this.threadId];
+      if (SPOOF_OUTER_KEY && st && st.forcedKey !== null) {
+        try { writeBytes(this.context.x0, st.forcedKey); } catch (_) {}
+      }
+    }
+  });
+
+  // sub_167C(dynamic, load_bias, auxv, r_debug) happens before hidden init/JNI entry.
+  attachOnce(m.base.add(DP_SUB_167C_RVA), 'outer sub_167C get hidden load_bias', {
+    onEnter(args) {
+      this.loadBias = args[1];
+      pendingHiddenLoadBias = this.loadBias;
+      log(`[sub_167C enter] hidden_load_bias=${this.loadBias}`);
+    },
+    onLeave(retval) {
+      log(`[sub_167C leave] ret=${retval} hidden_load_bias=${this.loadBias}`);
+    }
+  });
+
+  // Outer JNI_OnLoad calls hidden entry through:
+  //   0x464 LDR X8, [X19,#0x230]  ; hidden entry = hidden_base+0x4E354
+  //   0x468 BLR X8
+  // This is latest clean point before hidden sub_4E354 runs. Compute digest first, then install hidden hooks.
+  attachOnce(m.base.add(DP_JNI_ONLOAD_CALL_HIDDEN_RVA), 'outer JNI_OnLoad before hidden entry', {
+    onEnter() {
+      const hiddenEntry = this.context.x8;
+      const loadBias = pendingHiddenLoadBias || hiddenEntry.sub(H_SUB_4E354_RVA);
+      log(`[outer JNI_OnLoad hidden call] entry=${hiddenEntry} load_bias=${loadBias}`);
+      computeRuntimeCleanSub3E038Digest(loadBias);
+      computeRuntimeCleanSub16190Hash(loadBias);
+      installHiddenHooks(loadBias);
+    }
+  });
+
+  attachOnce(m.base.add(TARGET_INIT_RVA), 'outer init 0x378', {
+    onEnter() { log(`[outer init] ${TARGET_LIB}+0x378 enter`); },
+    onLeave() { log(`[outer init] ${TARGET_LIB}+0x378 leave`); }
+  });
+}
+
+function main() {
+  mkdirOne(DUMP_DIR);
+
+  const linker = findLinkerModule();
+  if (!linker) { warn('linker/linker64 not found'); return; }
+  log(`[start] linker=${linker.name} base=${linker.base} path=${linker.path}`);
+
+  let syms;
+  try { syms = enumSymbols(linker); }
+  catch (e) { warn(`cannot enumerate linker symbols: ${e}`); return; }
+
+  const getRealpathSym = syms.find(s => s.type === 'function' && s.name.indexOf('soinfo') !== -1 && s.name.indexOf('get_realpath') !== -1);
+  const getSonameSym = syms.find(s => s.type === 'function' && s.name.indexOf('soinfo') !== -1 && s.name.indexOf('get_soname') !== -1);
+  const getRealpath = getRealpathSym ? new NativeFunction(getRealpathSym.address, 'pointer', ['pointer']) : null;
+  const getSoname = getSonameSym ? new NativeFunction(getSonameSym.address, 'pointer', ['pointer']) : null;
+
+  function soinfoPath(si) {
+    for (const f of [getRealpath, getSoname]) {
+      if (f === null) continue;
+      try {
+        const s = safeCString(f(si));
+        if (s) return s;
+      } catch (_) {}
+    }
+    return `<soinfo ${si}>`;
+  }
+
+  const ctorSyms = syms.filter(s => s.type === 'function' &&
+    s.name.indexOf('call_constructors') !== -1 &&
+    s.name.indexOf('call_pre_init') === -1 &&
+    s.name.indexOf('call_destructors') === -1);
+
+  log(`[start] call_constructors hooks=${ctorSyms.length}`);
+  ctorSyms.forEach(s => {
+    Interceptor.attach(s.address, {
+      onEnter(args) {
+        this.path = soinfoPath(args[0]);
+        if (isTargetPath(this.path)) {
+          log(`[linker call_constructors] target=${this.path}`);
+          installOuterHooks(this.path);
+        }
+      }
+    });
+  });
+
+  if (ctorSyms.length === 0) warn('No call_constructors symbol found');
+}
+
+setImmediate(main);
