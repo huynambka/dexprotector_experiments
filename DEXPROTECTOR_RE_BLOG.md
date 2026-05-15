@@ -1,3 +1,5 @@
+AI SLOP
+
 # Mổ DexProtector trên `com.dexprotector.detector.envchecks`: từ loader tự chế đến bypass bằng clean snapshot
 
 > Ghi chú phạm vi: bài viết này ghi lại quá trình reverse trong lab/CTF sandbox. Mục tiêu là hiểu cơ chế của `libdexprotector.so`, hidden native image và các check bị Frida làm bẩn, sau đó xây một bypass tối thiểu để quan sát runtime.
