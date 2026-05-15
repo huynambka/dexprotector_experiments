@@ -4752,3 +4752,188 @@ Evidence from `/tmp/frida_bypass_dexprotector_164107.log`:
 ```
 
 No `Bad JNI version`, `Process crashed`, or `FATAL EXCEPTION` appeared before timeout.
+
+## 2026-05-14 — LibApplication.i dispatcher tracing script
+
+Created `trace_libapplication_i_resolver_frida17.js` from `bypass_dexprotector.js`.
+
+Purpose: keep the stable native DexProtector bypass, then after outer `JNI_OnLoad` succeeds, hook all overloads of:
+
+```java
+com.dexprotector.detector.envchecks.LibApplication.i(...)
+```
+
+The script logs:
+
+- overload signature / return type
+- opcode, both signed and hex
+- argument classes / primitive values
+- return class / primitive value
+- nested dispatcher depth
+
+Default mode is intentionally minimal and stable:
+
+```js
+const TRACE_LIBAPP_REFLECTION_RESOLVER = false;
+const TRACE_LIBAPP_JNI_RESOLVER = false;
+const TRACE_LIBAPP_JAVA_STACK = false;
+const TRACE_LIBAPP_OBJECT_TOSTRING = false;
+```
+
+Reason: stack capture, Java reflection hooks, and JNIEnv hooks can perturb protected class initialization. A short test with JNI resolver enabled exposed useful mappings like:
+
+```text
+opcode 0x24a1 / 9377 -> java.lang.System.currentTimeMillis()J
+opcode 0x2129 / 8489 -> android.os.SystemClock.elapsedRealtime()J
+opcode 0x24d9 / 9433 -> android.os.SystemClock.uptimeMillis()J
+opcode 0x63f2 / 25586 -> com.google.firebase.StartupTime.create(JJJ)
+```
+
+But full JNI resolver tracing is noisy/fragile, so it is off by default. For a targeted opcode, edit:
+
+```js
+const TRACE_LIBAPP_FOCUS_OPCODES = [9320];
+const TRACE_LIBAPP_JNI_RESOLVER = true;
+const TRACE_LIBAPP_LOG_ALL_CALLS = false;
+```
+
+Verification command:
+
+```bash
+timeout 30s ./frida17/bin/frida -U -f com.dexprotector.detector.envchecks \
+  -l trace_libapplication_i_resolver_frida17.js
+```
+
+Evidence from `/tmp/frida_trace_libapp_i_focuspatch_171842.log`:
+
+```text
+[outer JNI_OnLoad RETSITE normal] x0=0x10004 valid=true
+[LibApplication.i hook] installed 1176 overload(s)
+[LibApplication.i enter #3] sig=long i(int) opcode=0x24a1 (9377)
+[LibApplication.i leave #3] ret=1778753924224
+[LibApplication.i enter #7] sig=java.lang.Object i(int) opcode=0xffffec16 (-5098)
+[LibApplication.i leave #7] ret=com.google.firebase.AutoValue_StartupTime
+```
+
+No crash markers were observed before timeout in default minimal mode.
+
+## Dispatcher `LibApplication.i(...)` map opcode như thế nào (2026-05-14)
+
+Đã xác nhận layout của `assets/dp.mp3` sau decrypt/decompress (`dumps/ic_dat_dumps/dp_mp3_decompressed.bin`):
+
+- `u32[0x20] = 0x21af`: số class trong class-offset table.
+- `u32[0x24] = 0x12feb`: số dispatcher entry/opcode.
+- `entry_table = +0x28`, mỗi entry 16 bytes.
+- `class_offset_table = 0x28 + 0x12feb * 0x10 = 0x12fed8`.
+- Sau `class_offset_table + 0x21af*4` là string `com/dexprotector/detector/envchecks/LibApplication`; string pool thật bắt đầu sau NUL của string này: `string_pool = +0x1385c7`.
+
+Hidden native setup:
+
+- `sub_41108(env, class_offsets, class_count, entry_table, entry_count, string_pool)` lưu các base vào globals:
+  - `qword_8CB58 = entry_table`
+  - `dword_8CB50 = entry_count`
+  - `qword_8CB70 = class_offset_table`
+  - `qword_8CB60 = string_pool`
+  - tạo cache `qword_8CB78 = calloc(entry_count, 8)` cho `jfieldID/jmethodID`
+  - tạo Java object arrays để cache `jclass` / reflected members.
+- `sub_4DDB4` scan `LibApplication.getDeclaredMethods()`, tìm mọi method tên `i`, lấy shorty/proto, rồi `sub_4130C(shorty)` chọn native wrapper theo return type (`I`, `L`, `V`, ...). `sub_35F0C` ghi wrapper pointer vào ArtMethod/native entry.
+- Wrapper nhận `opcode` arg đầu. Mask opcode:
+  - nếu `opcode >= 0`: index = opcode
+  - nếu `opcode <= -9`: index = opcode & 0xffff
+  - nếu `-8 <= opcode < 0`: index = opcode & 0xf
+- `sub_40638(index, env)` kiểm tra index < `entry_count`, rồi trả về `entry_table + index*16`; nếu out-of-range thì throw exception chứa opcode hex.
+
+Format 1 entry 16 bytes:
+
+```c
+struct DpDispatchEntry {
+    uint32_t w0;        // bits: flags=w0&0x1f, kind=(w0>>5)&0x1f, class_idx=w0>>10
+    uint32_t name_rel;  // string_pool + name_rel
+    uint32_t sig_rel;   // string_pool + sig_rel
+    uint32_t extra_rel; // thường là shorty/proto, ví dụ IIL/VILL
+};
+```
+
+Handler selection:
+
+```c
+entry = entry_table[index];
+kind = (entry.w0 >> 5) & 0x1f;
+wrapper_base = base_by_return_type[shorty[0]];
+handler = op_handler_table[wrapper_base + kind];
+return handler(env, index, va_args);
+```
+
+Base wrapper đã thấy:
+
+- `Z`: 3, `B`: 11, `S`: 19, `C`: 27, `I`: 35, `J`: 43, `F`: 51, `D`: 59, `L`: 67, `V`: 78.
+
+Ví dụ đã xác nhận bằng Frida JNI trace:
+
+```text
+LibApplication.i(0x114dc, segment) overload int i(int,Object)
+entry_off = 0x114de8
+raw       = e3e052008a36160092fd0d006cff0d00
+w0        = 0x52e0e3 -> flags=3, kind=7, class_idx=5304
+class     = com/dexprotector/detector/envchecks/QrGen$Segment
+name      = bitLength
+sig       = I
+extra     = IIL
+ret I + kind 7 -> handler_slot 42 -> JNI GetIntField
+=> LibApplication.i(0x114dc, segment) == segment.bitLength
+```
+
+Tạo helper local: `parse_dp_dispatcher.py`.
+
+Ví dụ:
+
+```bash
+./parse_dp_dispatcher.py --ret I 0x114dc
+./parse_dp_dispatcher.py --ret V 9320
+```
+
+Opcode `9320` map ra:
+
+```text
+class="java/security/KeyPairGenerator"
+name="initialize"
+sig="(Ljava/security/spec/AlgorithmParameterSpec;)V"
+extra="VILL"
+kind=0, ret=V -> CallVoidMethod-like instance call
+```
+
+## classes0 smali dispatcher patcher (2026-05-14)
+
+Created scripts/artifacts for deobfuscating `LibApplication.i(opcode, ...)` in `classes0` using decrypted `dp.mp3`:
+
+- `parse_dp_dispatcher.py`: parse an opcode to class/name/signature/kind/flags.
+- `patch_classes0_dispatch.py`: patch baksmali output by replacing supported dispatcher calls with normal smali instructions.
+- `CLASSES0_DISPATCH_PATCH_NOTES.md`: commands/results.
+
+Generated smali:
+
+```text
+build/classes0_smali/                 # original baksmali output
+build/classes0_smali_patched/         # aggressive full direct-call patch; not buildable as single dex due method_id limit
+build/classes0_smali_fieldpatched/    # buildable: fields + new-instance only
+build/classes0_smali_apppatched/      # buildable: fields + new-instance + app-owned methods
+```
+
+Build outputs:
+
+```text
+build/out/classes0_fieldpatched.dex
+build/out/classes0_apppatched.dex
+```
+
+Important limitation: fully replacing every dispatcher method call in `classes0` creates too many direct method references for one DEX (`Unsigned short value out of range: 73567`). Therefore the buildable modes leave most library method dispatcher calls intact, while still replacing field access, new-instance, and optionally app-owned method calls.
+
+Full aggressive patched smali cannot be emitted as one dex because method references exceed the DEX 64K method-id encoding. Added `build_smali_shards.py` to split `build/classes0_smali_patched/` into buildable dex shards:
+
+```text
+build/out/classes0_fullpatched_shards/classes0_fullpatched_part00.dex .. part18.dex
+```
+
+These 19 shards are the buildable form of the aggressive classes0 dispatch patch.
+
+Update: after adding propagation for opcode aliases (`const vX; move v0, vX`) and temp-register rewrite for high-register `iget`, the aggressive `build/classes0_smali_patched/` now has **0** remaining `LibApplication.i(...)` calls. Single-dex assemble still fails due method-id overflow (`Unsigned short value out of range: 73608`), so the full aggressive build remains the 19-dex sharded output under `build/out/classes0_fullpatched_shards/`.
